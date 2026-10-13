@@ -1,0 +1,88 @@
+"""RMSNorm variants used by the NCP Qwen3.5 v2 checkpoint."""
+
+import os
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+
+def env_on(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def effective_weight(weight: Tensor) -> Tensor:
+    """Convert a zero-centered gamma to its effective scale."""
+    return weight + 1.0
+
+
+def eager_zero_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+    return (normalized * effective_weight(weight).float()).to(x.dtype)
+
+
+def zero_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    """HF ``ZeroCenteredRMSNorm`` with the validated optional kernels."""
+    if x.is_cuda and env_on("NCP_Q35V2_TE_RMS"):
+        from xtuner.v1.ops.rms_norm.ncp_qwen35_v2 import zero_rmsnorm_cuda
+
+        return zero_rmsnorm_cuda(x, weight, eps)
+    if env_on("NCP_Q35V2_TORCH_RMS"):
+        return F.rms_norm(x, (weight.numel(),), effective_weight(weight), eps)
+    return eager_zero_rms_norm(x, weight, eps)
+
+
+def mudd_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    """Route/output norm used by MUDD blocks in the reference model."""
+    enabled = os.environ.get("NCP_Q35V2_MUDD_RMS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not enabled:
+        return eager_zero_rms_norm(x, weight, eps)
+    return F.rms_norm(x, (weight.numel(),), effective_weight(weight), eps)
+
+
+class ZeroCenteredRMSNorm(nn.Module):
+    """RMSNorm whose stored weight is the offset from one."""
+
+    def __init__(self, width: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(width))
+        self.eps = float(eps)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return zero_rms_norm(x, self.weight, self.eps)
+
+
+class GatedDeltaNetInputRMSNorm(ZeroCenteredRMSNorm):
+    """Input norm matching the HF GDN layer's default torch RMSNorm path."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        if env_on("NCP_Q35V2_GDN_TORCH_INPUT_NORM", "1"):
+            return F.rms_norm(x, (self.weight.numel(),), effective_weight(self.weight), self.eps)
+        return super().forward(x)
+
+
+class MuddRMSNorm(nn.Module):
+    """Zero-centered RMSNorm with the MUDD numerical dispatch contract."""
+
+    def __init__(self, width: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(width))
+        self.eps = float(eps)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return mudd_rms_norm(x, self.weight, self.eps)
+
+
+__all__ = [
+    "GatedDeltaNetInputRMSNorm",
+    "MuddRMSNorm",
+    "ZeroCenteredRMSNorm",
+    "effective_weight",
+    "env_on",
+    "mudd_rms_norm",
+]

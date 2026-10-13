@@ -1,4 +1,4 @@
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 import torch
 import torch.nn as nn
@@ -6,7 +6,8 @@ import torch.nn as nn
 from xtuner.v1.config import GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
-from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig, RMSNorm
+from xtuner.v1.module.attention.attn_outputs import AttnOutputs
+from xtuner.v1.module.rms_norm.rms_norm import RMSNorm
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_mlp_act_fn
 from xtuner.v1.utils import ForwardState
@@ -25,6 +26,20 @@ except ImportError:
 
 
 from ..linear import build_linear
+
+
+class AttentionConfigProtocol(Protocol):
+    """Structural config contract consumed by ``DenseDecoderLayer``."""
+
+    def build(
+        self,
+        hidden_size: int,
+        layer_type: Literal["full_attention", "sliding_attention"] | None = None,
+        layer_idx: int = 0,
+        rope_scaling_cfg: RopeScalingConfig | None = None,
+        generate_config: GenerateConfig | None = None,
+        float8_cfg: Float8Config | None = None,
+    ) -> nn.Module: ...
 
 
 class DenseDecoderLayerOutput(TypedDict):
@@ -75,7 +90,7 @@ class DenseDecoderLayer(nn.Module):
         hidden_act: str,
         rms_norm_eps: float = 1e-6,
         rms_norm_type: Literal["default", "zero_centered"] = "default",
-        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig,
+        attention_config: AttentionConfigProtocol,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,
@@ -83,6 +98,11 @@ class DenseDecoderLayer(nn.Module):
         layer_idx: int = 0,
         situ_beta: float = 1.0,
         situ_linear_beta: float | None = None,
+        mlp: nn.Module | None = None,
+        input_layernorm: nn.Module | None = None,
+        post_attention_layernorm: nn.Module | None = None,
+        attention_output_norm: nn.Module | None = None,
+        mlp_output_norm: nn.Module | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -95,17 +115,31 @@ class DenseDecoderLayer(nn.Module):
             generate_config=generate_config,
             float8_cfg=float8_cfg,
         )
-        self.mlp = self.build_mlp(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            bias=mlp_bias,
-            hidden_act=hidden_act,
-            float8_cfg=float8_cfg,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
+        self.mlp = (
+            mlp
+            if mlp is not None
+            else self.build_mlp(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                bias=mlp_bias,
+                hidden_act=hidden_act,
+                float8_cfg=float8_cfg,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
         )
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
+        self.input_layernorm = (
+            input_layernorm
+            if input_layernorm is not None
+            else RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
+        )
+        self.post_attention_layernorm = (
+            post_attention_layernorm
+            if post_attention_layernorm is not None
+            else RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
+        )
+        self.attention_output_norm = attention_output_norm if attention_output_norm is not None else nn.Identity()
+        self.mlp_output_norm = mlp_output_norm if mlp_output_norm is not None else nn.Identity()
 
     def build_mlp(
         self,
@@ -132,7 +166,7 @@ class DenseDecoderLayer(nn.Module):
     def forward(
         self,
         *hidden_states: torch.Tensor | list[torch.Tensor],
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]] | None,
         seq_ctx: SequenceContext | list[SequenceContext],
         mudd_streams: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -145,8 +179,9 @@ class DenseDecoderLayer(nn.Module):
         Args:
             hidden_states (torch.Tensor | list[torch.Tensor]): Input hidden states, one tensor per
                 micro-batch.
-            position_embeddings (tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]]):
-                Rotary position embeddings ``(cos, sin)``, aligned with ``hidden_states``.
+            position_embeddings (tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]] | None):
+                Rotary position embeddings ``(cos, sin)``, aligned with ``hidden_states``. Attention modules that
+                derive positions from ``seq_ctx`` may accept ``None``.
             seq_ctx (SequenceContext | list[SequenceContext]): Sequence context, aligned with
                 ``hidden_states``.
         Returns:
@@ -162,7 +197,9 @@ class DenseDecoderLayer(nn.Module):
             raise ValueError("DenseDecoderLayer requires at least one hidden-state tensor")
 
         if len(normalized_hidden_states) == 1:
-            assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
+            assert position_embeddings is None or (
+                isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
+            )
             assert isinstance(seq_ctx, SequenceContext)
             return self._forward(
                 hidden_states=normalized_hidden_states[0],
@@ -188,7 +225,7 @@ class DenseDecoderLayer(nn.Module):
     def _forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
         seq_ctx: SequenceContext,
         mudd_streams: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -213,12 +250,14 @@ class DenseDecoderLayer(nn.Module):
             mudd_inputs=mudd_inputs,
         )
         hidden_states = attn_outputs["projected_output"]
+        hidden_states = self.attention_output_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_output_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -241,12 +280,14 @@ class DenseDecoderLayer(nn.Module):
             seq_ctx=seq_ctx,
             past_key_values=past_key_values,
         )
+        hidden_states = self.attention_output_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_output_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -268,12 +309,14 @@ class DenseDecoderLayer(nn.Module):
             seq_ctx=seq_ctx,
             state=ForwardState.DECODING,  # type: ignore   # TODO: Fix outdated interface
         )
+        hidden_states = self.attention_output_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_output_norm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
