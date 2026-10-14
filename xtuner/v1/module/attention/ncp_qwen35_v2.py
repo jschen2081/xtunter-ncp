@@ -5,6 +5,7 @@ parameter layout and numerical order of the pinned HF checkpoint.
 """
 
 import math
+import os
 from typing import Literal
 
 import torch
@@ -19,7 +20,8 @@ from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.gated_deltanet.gen_seq_idx import gen_seq_idx
 
-from ..rms_norm.ncp_qwen35_v2 import ZeroCenteredRMSNorm
+from ..linear import build_linear
+from ..rms_norm.ncp_qwen35_v2 import ZeroCenteredRMSNorm, env_on
 from .attn_outputs import AttnOutputs
 
 
@@ -44,8 +46,13 @@ class NCPQwen35V2MLAConfig(BaseModel):
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,
     ) -> "NCPQwen35V2MLA":
-        del layer_type, rope_scaling_cfg, generate_config, float8_cfg
-        return NCPQwen35V2MLA(hidden_size=hidden_size, layer_idx=layer_idx, **self.model_dump())
+        del layer_type, rope_scaling_cfg, generate_config
+        return NCPQwen35V2MLA(
+            hidden_size=hidden_size,
+            layer_idx=layer_idx,
+            float8_cfg=float8_cfg,
+            **self.model_dump(),
+        )
 
 
 class NCPQwen35V2GatedDeltaNetConfig(BaseModel):
@@ -68,8 +75,33 @@ class NCPQwen35V2GatedDeltaNetConfig(BaseModel):
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,
     ) -> "NCPQwen35V2GatedDeltaNet":
-        del layer_type, rope_scaling_cfg, generate_config, float8_cfg
-        return NCPQwen35V2GatedDeltaNet(hidden_size=hidden_size, layer_idx=layer_idx, **self.model_dump())
+        del layer_type, rope_scaling_cfg, generate_config
+        return NCPQwen35V2GatedDeltaNet(
+            hidden_size=hidden_size,
+            layer_idx=layer_idx,
+            float8_cfg=float8_cfg,
+            **self.model_dump(),
+        )
+
+
+def _production_feature_enabled(name: str) -> bool:
+    override = os.environ.get(name)
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return not env_on("XTUNER_HF_IMPL")
+
+
+def _fused_zero_rms_norm_gate(
+    x: Tensor,
+    gate: Tensor,
+    zero_centered_weight: Tensor,
+    eps: float,
+) -> Tensor:
+    from xtuner.v1.ops.gated_deltanet.ncp_qwen35_v2 import zero_rms_norm_gate
+
+    if isinstance(zero_centered_weight, DTensor):
+        zero_centered_weight = zero_centered_weight.to_local()
+    return zero_rms_norm_gate(x, gate, zero_centered_weight, eps)
 
 
 def _apply_partial_rope(x: Tensor, positions: Tensor, rotary_base: float, width: int) -> Tensor:
@@ -89,10 +121,21 @@ def _causal_attention(query: Tensor, key: Tensor, value: Tensor, seq_ctx: Sequen
         from xtuner.v1.ops import flash_attn_varlen_func
 
         if flash_attn_varlen_func is not None:
+            # The repository FA2 wrapper assumes equal Q/K/V head widths;
+            # MLA uses a smaller V width. FA3 also requires alignment to 8.
+            # Keep the explicit QK scale and trim
+            # the zero-padded value channels after attention.
+            value_width = value.shape[-1]
+            head_width = math.ceil(max(query.shape[-1], value_width) / 8) * 8
+            if query.shape[-1] != head_width:
+                query = F.pad(query, (0, head_width - query.shape[-1]))
+                key = F.pad(key, (0, head_width - key.shape[-1]))
+            if value_width != head_width:
+                value = F.pad(value, (0, head_width - value_width))
             output = flash_attn_varlen_func(
-                query.squeeze(0),
-                key.squeeze(0),
-                value.squeeze(0),
+                query.squeeze(0).contiguous(),
+                key.squeeze(0).contiguous(),
+                value.squeeze(0).contiguous(),
                 cu_seqlens_q=cu,
                 cu_seqlens_k=seq_ctx.cu_seq_lens_k,
                 max_seqlen_q=seq_ctx.max_length_q,
@@ -100,7 +143,7 @@ def _causal_attention(query: Tensor, key: Tensor, value: Tensor, seq_ctx: Sequen
                 causal=True,
                 softmax_scale=scale,
             )
-            return output.unsqueeze(0)
+            return output[..., :value_width].unsqueeze(0)
     if cu.numel() == 2:
         return F.scaled_dot_product_attention(
             query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), is_causal=True, scale=scale
@@ -136,6 +179,7 @@ class NCPQwen35V2MLA(nn.Module):
         rotary_base: float,
         rms_norm_eps: float,
         layer_idx: int = 0,
+        float8_cfg: Float8Config | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -146,17 +190,37 @@ class NCPQwen35V2MLA(nn.Module):
         self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.v_head_dim = v_head_dim
         self.rotary_base = rotary_base
-        self.q_down = nn.Linear(hidden_size, q_lora_rank, bias=False)
+        self.q_down = build_linear(hidden_size, q_lora_rank, bias=False, float8_cfg=float8_cfg)
         self.q_norm = ZeroCenteredRMSNorm(q_lora_rank, rms_norm_eps)
-        self.q_up = nn.Linear(q_lora_rank, num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim), bias=False)
-        self.kv_down = nn.Linear(hidden_size, kv_lora_rank + qk_pos_emb_head_dim, bias=False)
+        self.q_up = build_linear(
+            q_lora_rank,
+            num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim),
+            bias=False,
+            float8_cfg=float8_cfg,
+        )
+        self.kv_down = build_linear(
+            hidden_size,
+            kv_lora_rank + qk_pos_emb_head_dim,
+            bias=False,
+            float8_cfg=float8_cfg,
+        )
         self.kv_norm = ZeroCenteredRMSNorm(kv_lora_rank, rms_norm_eps)
-        self.kv_up = nn.Linear(kv_lora_rank, num_attention_heads * (qk_head_dim + v_head_dim), bias=False)
+        self.kv_up = build_linear(
+            kv_lora_rank,
+            num_attention_heads * (qk_head_dim + v_head_dim),
+            bias=False,
+            float8_cfg=float8_cfg,
+        )
         self.q_content_norm = nn.RMSNorm(qk_head_dim, eps=rms_norm_eps)
         self.k_content_norm = nn.RMSNorm(qk_head_dim, eps=rms_norm_eps)
         self.q_pos_norm = nn.RMSNorm(qk_pos_emb_head_dim, eps=rms_norm_eps)
         self.k_pos_norm = nn.RMSNorm(qk_pos_emb_head_dim, eps=rms_norm_eps)
-        self.out_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=False)
+        self.out_proj = build_linear(
+            num_attention_heads * v_head_dim,
+            hidden_size,
+            bias=False,
+            float8_cfg=float8_cfg,
+        )
 
     def forward(
         self,
@@ -230,6 +294,11 @@ def _cpu_delta_documents(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tenso
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
 
 
+def _delta_rule_cu_seqlens(seq_ctx: SequenceContext) -> Tensor | None:
+    cu_seqlens = seq_ctx.cu_seq_lens_q
+    return cu_seqlens if cu_seqlens.numel() > 2 else None
+
+
 class NCPQwen35V2GatedDeltaNet(nn.Module):
     """GDN preserving the checkpoint's single fused input projection."""
 
@@ -244,6 +313,7 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         hidden_act: str,
         rms_norm_eps: float,
         layer_idx: int = 0,
+        float8_cfg: Float8Config | None = None,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
@@ -256,6 +326,8 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         self.key_dim = num_key_heads * key_head_dim
         self.value_dim = num_value_heads * value_head_dim
         self.conv_kernel_dim = conv_kernel_dim
+        self.use_fused_qk_l2 = _production_feature_enabled("XTUNER_GDN_FUSED_QK_L2")
+        self.use_fused_norm_gate = _production_feature_enabled("XTUNER_GDN_FUSED_NORM_GATE")
         conv_dim = 2 * self.key_dim + self.value_dim
         self.in_proj = nn.Linear(hidden_size, conv_dim + self.value_dim + 2 * self.num_v_heads, bias=False)
         self.conv1d = nn.Conv1d(
@@ -264,7 +336,12 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.zeros(self.num_v_heads))
         self.dt_bias = nn.Parameter(torch.zeros(self.num_v_heads))
         self.out_norm = ZeroCenteredRMSNorm(self.head_v_dim, rms_norm_eps)
-        self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        self.out_proj = build_linear(
+            self.value_dim,
+            hidden_size,
+            bias=False,
+            float8_cfg=float8_cfg,
+        )
 
     def forward(
         self,
@@ -289,14 +366,21 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         if qkv.is_cuda:
             from xtuner.v1.ops.gated_deltanet import get_causal_conv1d_fn
 
-            qkv = get_causal_conv1d_fn()(x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx)
+            qkv = get_causal_conv1d_fn()(
+                x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx
+            )
         else:
             qkv = _cpu_conv_documents(qkv, self.conv1d, seq_ctx.cu_seq_lens_q)
         query_key, value = qkv.split((2 * self.key_dim, self.value_dim), dim=-1)
         query_key = query_key.reshape(*qkv.shape[:2], 2 * self.num_k_heads, self.head_k_dim)
         value = value.reshape(*qkv.shape[:2], self.num_v_heads, self.head_v_dim)
-        query_key = query_key.float() * torch.rsqrt(query_key.float().square().sum(-1, keepdim=True) + 1.0e-6)
-        query, key = query_key.to(qkv.dtype).split(self.num_k_heads, dim=2)
+        use_kernel_qk_l2 = qkv.is_cuda and self.use_fused_qk_l2
+        if not use_kernel_qk_l2:
+            query_key = query_key.float() * torch.rsqrt(
+                query_key.float().square().sum(-1, keepdim=True) + 1.0e-6
+            )
+            query_key = query_key.to(qkv.dtype)
+        query, key = query_key.split(self.num_k_heads, dim=2)
         repeats = self.num_v_heads // self.num_k_heads
         query = query.repeat_interleave(repeats, dim=2)
         key = key.repeat_interleave(repeats, dim=2)
@@ -313,13 +397,17 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
                 value.contiguous(),
                 g=decay.contiguous(),
                 beta=beta.contiguous(),
-                use_qk_l2norm_in_kernel=False,
-                cu_seqlens=seq_ctx.cu_seq_lens_q,
+                use_qk_l2norm_in_kernel=use_kernel_qk_l2,
+                cu_seqlens=_delta_rule_cu_seqlens(seq_ctx),
             )
         else:
             output = _cpu_delta_documents(query, key, value, decay, beta, seq_ctx.cu_seq_lens_q)
-        normalized = self.out_norm(output)
-        gated = (normalized.float() * F.silu(z.reshape_as(output).float())).to(qkv.dtype)
+        gate = z.reshape_as(output)
+        if output.is_cuda and self.use_fused_norm_gate:
+            gated = _fused_zero_rms_norm_gate(output, gate, self.out_norm.weight, self.out_norm.eps)
+        else:
+            normalized = self.out_norm(output)
+            gated = (normalized.float() * F.silu(gate.float())).to(qkv.dtype)
         raw_output = gated.flatten(-2)
         return {"raw_output": raw_output, "projected_output": self.out_proj(raw_output)}
 

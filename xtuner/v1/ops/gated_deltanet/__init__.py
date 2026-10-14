@@ -13,6 +13,9 @@ switch between fast / fused paths and HF-exact paths. Under `XTUNER_HF_IMPL=true
   binds the channel-last/seq_idx convention together via an internal transpose, which gives a
   different backward op graph from HF's call pattern even though forward is bitwise.
 
+`XTUNER_GDN_CUSTOM_OP` independently overrides the delta-rule dispatcher, allowing
+compile-friendly custom ops while keeping the other HF implementations selected.
+
 These switches are only meant for the bitwise-parity tests. Production / training stays on the
 XTuner path (compile-friendly custom_op wraps + seq_idx-aware kernel dispatch).
 
@@ -44,6 +47,13 @@ def _npu_conv_enabled() -> bool:
     return os.environ.get("XTUNER_NPU_CONV", "1") == "1" and get_device() == "npu"
 
 
+def _custom_op_enabled() -> bool:
+    override = os.getenv("XTUNER_GDN_CUSTOM_OP")
+    if override is not None:
+        return override.strip().lower() in _TRUTHY
+    return not _hf_impl_enabled()
+
+
 def _hf_causal_conv1d_adapter(x, weight, bias, activation, seq_idx):
     from causal_conv1d import causal_conv1d_fn as _hf_causal_conv1d_fn
 
@@ -56,7 +66,7 @@ def _hf_causal_conv1d_adapter(x, weight, bias, activation, seq_idx):
 
 
 def get_chunk_gated_delta_rule_fn():
-    if _hf_impl_enabled():
+    if not _custom_op_enabled():
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _hf_chunk_gated_delta_rule
 
         return _hf_chunk_gated_delta_rule

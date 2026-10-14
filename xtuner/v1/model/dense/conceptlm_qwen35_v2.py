@@ -32,7 +32,7 @@ from typing_extensions import override
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss import BaseLossContext
-from xtuner.v1.model.base import BaseModel, HFSaveCfg
+from xtuner.v1.model.base import DEFAULT_FLOAT8_CFG, BaseModel, HFSaveCfg, TorchCompileOption
 from xtuner.v1.model.utils import apply_activation_checkpointing
 from xtuner.v1.module import LMHead, RMSNorm
 from xtuner.v1.module.attention.ncp_qwen35_v2 import (
@@ -67,6 +67,18 @@ except ImportError:
 DEVICE = get_device()
 Streams = tuple[Tensor, Tensor, Tensor, Tensor]
 _MAX_CROSS_MUDD_SOURCES = 25
+
+CONCEPTLM_QWEN35_V2_COMPILE_CFG: dict[str, TorchCompileOption] = {
+    "xtuner.v1.module.decoder_layer.dense_decoder_layer.DenseDecoderLayer.forward": TorchCompileOption(
+        fullgraph=True
+    ),
+    "xtuner.v1.model.dense.conceptlm_qwen35_v2.SelfMUDDRoute.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.model.dense.conceptlm_qwen35_v2.CrossMUDDRoute.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.model.dense.conceptlm_qwen35_v2.PredictedConceptInjection.forward": TorchCompileOption(
+        fullgraph=True
+    ),
+    **DEFAULT_FLOAT8_CFG,
+}
 
 
 def _block_end_indices(num_layers: int, block_size: int) -> list[int]:
@@ -679,6 +691,12 @@ class ConceptLMQwen35V2(BaseModel):
         self.fusion_alpha = nn.Parameter(torch.ones(1))
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
         self._init_load_spec()
+        self._maybe_enable_compile(self.compile_cfg)
+
+    @property
+    @override
+    def default_compile_cfg(self) -> dict[str, TorchCompileOption]:
+        return CONCEPTLM_QWEN35_V2_COMPILE_CFG
 
     # --------------------------------------------------------------- forward
     def to_hf_key_list(self, key: str) -> list[str]:
@@ -701,6 +719,13 @@ class ConceptLMQwen35V2(BaseModel):
         if hf_param_name == "model.fusion_alpha" and safetensor.shape == (1,):
             return safetensor.reshape(())
         return safetensor
+
+    @override
+    def _mark_dynamic(self, seq_ctx: SequenceContext, dim: int = 0) -> None:
+        # GDN specializes the single-document dense path (two offsets). Allow
+        # that specialization while keeping packed document counts dynamic.
+        torch._dynamo.maybe_mark_dynamic(seq_ctx.cu_seq_lens_q, dim)
+        torch._dynamo.maybe_mark_dynamic(seq_ctx.cu_seq_lens_k, dim)
 
     def _token_context(
         self, seq_ctx: SequenceContext, orig_lengths: list[int]
@@ -842,7 +867,11 @@ class ConceptLMQwen35V2(BaseModel):
         if self.config.float8_cfg is not None:
             from xtuner.v1.float8.float8_handler import Float8Handler
 
-            Float8Handler.pad_for_fsdp(self, self.fsdp_mesh, callback_after_pad=self._init_load_spec)  # type: ignore[arg-type]
+            Float8Handler.pad_for_fsdp(
+                self,
+                self.fsdp_mesh,
+                callback_after_pad=self._init_load_spec,
+            )  # type: ignore[arg-type]
 
         checkpoint_preserve_rng_state = fsdp_config.checkpoint_preserve_rng_state
         if not checkpoint_preserve_rng_state and self.config.attention.dropout > 0.0:
