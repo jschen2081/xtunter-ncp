@@ -28,6 +28,7 @@ from xtuner.v1.module.attention import (
 from xtuner.v1.module.attention.ncp_qwen35_v2 import (
     NCPQwen35V2GatedDeltaNetConfig,
     NCPQwen35V2MLAConfig,
+    _cpu_conv_documents,
     _delta_rule_cu_seqlens,
     _fused_zero_rms_norm_gate,
     _production_feature_enabled,
@@ -36,6 +37,19 @@ from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.fused_swiglu import FusedSwiGLUMLP
 from xtuner.v1.module.rms_norm import GatedDeltaNetInputRMSNorm, MuddRMSNorm, ZeroCenteredRMSNorm
 from xtuner.v1.ops import gated_deltanet as gdn_ops
+
+
+@pytest.mark.parametrize("lengths", [[16], [3, 13]])
+def test_gdn_cpu_convolution_preserves_sp_head_shards(lengths: list[int]) -> None:
+    torch.manual_seed(11)
+    qkv = torch.randn(1, sum(lengths), 12)
+    weight = torch.randn(12, 4)
+    boundaries = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+    # One rank's channels from each of the Q, K and V projection blocks.
+    channels = torch.tensor([0, 1, 4, 5, 8, 9])
+    expected = _cpu_conv_documents(qkv, weight, boundaries).index_select(2, channels)
+    actual = _cpu_conv_documents(qkv.index_select(2, channels), weight.index_select(0, channels), boundaries)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class _TinyV2Config(ConceptLMQwen35V2Config):
@@ -193,6 +207,17 @@ class TestConceptLMQwen35V2DenseLayer:
         for projection in (mla.q_down, mla.q_up, mla.kv_down, mla.kv_up, mla.out_proj):
             assert type(projection) is not torch.nn.Linear
 
+    def test_fp32_save_policy_preserves_gdn_convolution_in_all_stacks(self, config: _TinyV2Config) -> None:
+        model = config.build()
+        for stack in (model.encoder, model.predictor, model.decoder):
+            for layer in stack.layers.values():
+                if not isinstance(layer.self_attn, NCPQwen35V2GatedDeltaNet):
+                    continue
+                parameter = layer.self_attn.conv1d.weight
+                name = next(name for name, value in model.named_parameters() if value is parameter)
+                hf_name = model.to_hf_key_list(name)[0]
+                assert model._get_save_dtype(hf_name, torch.bfloat16) == torch.float32
+
     def test_default_compile_is_enabled_during_model_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
         compile_configs: list[object] = []
 
@@ -282,9 +307,10 @@ class TestConceptLMQwen35V2PaddingContract:
         seq_ctx = _context([3, 5])
         seq_ctx.input_ids = torch.arange(8).unsqueeze(0)
 
-        padded_ctx, padded_lengths = model._token_context(seq_ctx, [3, 5])
+        padded_ctx, padded_lengths, compute_lengths = model._token_context(seq_ctx, [3, 5])
 
         assert padded_lengths == [8, 8]
+        assert compute_lengths == padded_lengths
         assert padded_ctx.input_ids is not None
         torch.testing.assert_close(padded_ctx.input_ids[:, :3], torch.tensor([[0, 1, 2]]), rtol=0, atol=0)
         torch.testing.assert_close(padded_ctx.input_ids[:, 8:13], torch.tensor([[3, 4, 5, 6, 7]]), rtol=0, atol=0)
@@ -299,10 +325,11 @@ class TestConceptLMQwen35V2PaddingContract:
         model = config.build()
         seq_ctx = _context([8, 12])
 
-        token_ctx, padded_lengths = model._token_context(seq_ctx, [8, 12])
+        token_ctx, padded_lengths, compute_lengths = model._token_context(seq_ctx, [8, 12])
 
         assert token_ctx is seq_ctx
         assert padded_lengths == [8, 12]
+        assert compute_lengths == padded_lengths
 
     def test_short_inputs_embeds_are_rejected_before_padding(self, config: _TinyV2Config) -> None:
         model = config.build()
@@ -336,7 +363,7 @@ class TestConceptLMQwen35V2ConfigContract:
         "updates,error",
         [
             ({"hidden_size": 30}, "hidden_size must be divisible"),
-            ({"linear_attention": None}, "requires the 9B GatedDeltaNet config"),
+            ({"linear_attention": None}, "valid dictionary or instance of GatedDeltaNetConfig"),
             ({"self_mudd_block_size": 0}, "positive MUDD block sizes"),
             ({"qk_pos_emb_head_dim": 3}, "positional head dim must be even"),
         ],

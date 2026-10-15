@@ -333,12 +333,18 @@ def _cpu_delta_rule(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor) ->
     return torch.stack(outputs, dim=1).to(v.dtype)
 
 
-def _cpu_conv_documents(qkv: Tensor, conv: nn.Conv1d, cu_seq_lens: Tensor) -> Tensor:
+def _cpu_conv_documents(qkv: Tensor, weight: Tensor, cu_seq_lens: Tensor) -> Tensor:
     bounds = cu_seq_lens.detach().cpu().tolist()
     pieces: list[Tensor] = []
     for start, end in zip(bounds[:-1], bounds[1:], strict=True):
         piece = qkv[:, int(start) : int(end)]
-        pieces.append(F.silu(conv(piece.transpose(1, 2))[..., : piece.shape[1]]).transpose(1, 2))
+        convolved = F.conv1d(
+            piece.transpose(1, 2),
+            weight.unsqueeze(1),
+            padding=weight.shape[1] - 1,
+            groups=weight.shape[0],
+        )
+        pieces.append(F.silu(convolved[..., : piece.shape[1]]).transpose(1, 2))
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
 
 
@@ -426,6 +432,8 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         beta = F.linear(q_input, weights[4])
         alpha = F.linear(q_input, weights[5])
         weight = self.conv1d.weight.squeeze(1)
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
         sp_mesh = seq_ctx.sequence_parallel_mesh
         if sp_mesh is not None and sp_mesh.size() > 1:
             sp_size = sp_mesh.size()
@@ -458,7 +466,7 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
                 x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx
             )
         else:
-            qkv = _cpu_conv_documents(qkv, self.conv1d, seq_ctx.cu_seq_lens_q)
+            qkv = _cpu_conv_documents(qkv, weight.to(qkv.dtype), seq_ctx.cu_seq_lens_q)
         sp_size = sp_mesh.size() if sp_mesh is not None else 1
         local_key_dim = self.key_dim // sp_size
         local_value_dim = self.value_dim // sp_size

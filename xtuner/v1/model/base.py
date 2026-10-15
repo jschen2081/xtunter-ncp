@@ -606,8 +606,30 @@ class BaseModel(nn.Module):
         loaded_keys, unloaded_keys, missing_keys = self._load_params(hf_loader, strict=strict)
         return loaded_keys, unloaded_keys, missing_keys
 
-    def scale_and_reduce_grad(self):
-        return
+    @torch.no_grad()
+    def scale_and_reduce_grad(self) -> None:
+        """Average gradients of replicated parameters explicitly excluded from FSDP."""
+        ignored_names: set[str] = getattr(self, "_fsdp_ignored_param_names", set())
+        grads_by_group: dict[dist.ProcessGroup, list[torch.Tensor]] = {}
+        for name, param in self.named_parameters():
+            if self._clean_param_name(name) not in ignored_names or param.grad is None:
+                continue
+            assert isinstance(param, DTensor)
+            assert all(isinstance(placement, Replicate) for placement in param.placements)
+            mesh = param.device_mesh
+            if mesh.ndim > 1:
+                mesh = mesh._flatten()
+            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+            # Native LM loss uses an autograd-aware global SUM. Its backward
+            # contributes a world-size factor, even for SP-owned conv channels.
+            # Match the mean reduction applied to FSDP-managed gradients.
+            grad.div_(mesh.size())
+            grads_by_group.setdefault(mesh.get_group(), []).append(grad)
+
+        for group, grads in grads_by_group.items():
+            with dist._coalescing_manager(group=group):
+                for grad in grads:
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
 
     def cal_grad_norm(self, grads: list[DTensor], dtype=torch.float32):
         from xtuner.v1.utils.grad_norm import cal_grad_norm
@@ -684,6 +706,7 @@ class BaseModel(nn.Module):
 
                 for hf_name in hf_name_list:
                     if any(re.search(p, hf_name) for p in patterns):  # type: ignore
+                        self.__dict__.setdefault("_fsdp_ignored_param_names", set()).add(full_name)
                         if not isinstance(param, DTensor):
                             dist_param = nn.Parameter(
                                 distribute_tensor(

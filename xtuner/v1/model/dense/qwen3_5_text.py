@@ -53,12 +53,13 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
     # The dense text tower emits the standalone ``model.<...>`` layout; this remaps it
     # to the VLM's ``model.language_model.<...>`` namespace on both load and save.
     hf_key_mapping: dict[str, str] | None = {r"^model\.": "model.language_model."}
-    # Qwen3.5 keeps the GatedDeltaNet gated-RMSNorm weight and the per-head decay
-    # parameter ``A_log`` in fp32; the rest of the model runs in bf16.
+    # Preserve FP32 convolution gradients through replica reduction; the
+    # convolution wrapper still casts weights to BF16 for forward computation.
     hf_save_cfg: HFSaveCfg = HFSaveCfg(
         fp32_keys_pattern=[
             r"model\.language_model\.layers\.\d+\.linear_attn\.norm\.weight",
             r"model\.language_model\.layers\.\d+\.linear_attn\.A_log",
+            r"model\.language_model\.layers\.\d+\.linear_attn\.conv1d\.weight",
         ],
     )
     mudd_enabled: bool = False

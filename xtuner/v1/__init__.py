@@ -1,23 +1,51 @@
+import inspect
 import os
 from typing import Any, cast
 
 
 def _patch_triton_autotune_for_determinism() -> None:
-    # 必须放在 xtuner.v1 初始化最前面：FLA kernel 在导入时就会读取 triton.autotune 装饰器。
-    # 如果等到 GatedDeltaNet 模块导入后再 patch，单独使用 xtuner 包的场景可能已经错过时机。
+    """Pin kernel selection before importing FLA or other Triton operators."""
     import triton
+    from triton.runtime.autotuner import Autotuner
+
+    # FLA 0.5's CachedAutotuner constructs an Autotuner subclass directly,
+    # bypassing triton.autotune. Pin the shared constructor as well, before
+    # importing FLA: SP changes head counts and therefore its tuning keys.
+    # FLA's on-disk config lookup can replace even a single pinned candidate.
+    os.environ["FLA_CACHE_MODE"] = "disabled"
+    original_init = Autotuner.__init__
+    if not getattr(original_init, "_xtuner_deterministic_patched", False):
+        supports_cache_results = "cache_results" in inspect.signature(original_init).parameters
+
+        def deterministic_init(
+            self: Any, fn: Any, arg_names: list[str], configs: list[Any], *args: Any, **kwargs: Any
+        ) -> None:
+            if configs:
+                configs = configs[:1]
+            if supports_cache_results:
+                kwargs["cache_results"] = False
+            else:
+                kwargs.pop("cache_results", None)
+            original_init(self, fn, arg_names, configs, *args, **kwargs)
+
+        patched_init = cast(Any, deterministic_init)
+        patched_init._xtuner_deterministic_patched = True
+        patched_init._xtuner_original_init = original_init
+        Autotuner.__init__ = patched_init
 
     original_autotune = triton.autotune
     if getattr(original_autotune, "_xtuner_deterministic_patched", False):
         return
 
-    def deterministic_autotune(configs, *args, **kwargs):
-        # Triton autotune 会按 benchmark/cache 在多个 kernel config 中选一个实现；
-        # 不同 cache 目录或计时抖动可能选到不同 tiling/num_warps/reduction 路径，
-        # 从而改变浮点累加顺序。确定性模式固定第一个 config，并禁用 cache 结果。
+    supports_autotune_cache = "cache_results" in inspect.signature(original_autotune).parameters
+
+    def deterministic_autotune(configs: list[Any], *args: Any, **kwargs: Any) -> Any:
         if configs:
             configs = configs[:1]
-        kwargs["cache_results"] = False
+        if supports_autotune_cache:
+            kwargs["cache_results"] = False
+        else:
+            kwargs.pop("cache_results", None)
         return original_autotune(configs, *args, **kwargs)
 
     patched = cast(Any, deterministic_autotune)

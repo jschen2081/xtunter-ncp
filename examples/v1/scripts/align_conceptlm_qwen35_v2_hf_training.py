@@ -10,7 +10,9 @@ By default only four small norm weights are trainable. They sit near the start
 of each tower, so their gradients exercise almost the complete downstream
 autograd graph without allocating optimizer states for all 9B parameters.
 Pass ``--full-parameters`` to train every parameter and compare only the loss
-and global gradient norm. This avoids materializing full-model CPU snapshots.
+and global gradient norm. In this mode XTuner and HF each own an independent
+AdamW optimizer and parameter trajectory; weights are never synchronized after
+initial checkpoint loading. This avoids materializing full-model CPU snapshots.
 
 Launch from the repository root::
 
@@ -492,65 +494,39 @@ def _run_hf_full_steps(
     return failed_steps
 
 
-def _sync_hf_parameters_from_xtuner(
-    xtuner_parameters: dict[str, Any],
-    mapping: dict[str, str],
-    hf_parameters: dict[str, Any] | None,
-    rank: int,
-) -> None:
-    """Copy one updated XTuner parameter at a time into the rank-0 HF model."""
-    import torch
-    import torch.distributed as dist
-    from torch.distributed.tensor import DTensor
-
-    sync_error = None
-    for xtuner_name, parameter in xtuner_parameters.items():
-        full_parameter = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
-        if rank == 0 and sync_error is None:
-            try:
-                assert hf_parameters is not None
-                hf_parameter = hf_parameters[mapping[xtuner_name]]
-                if full_parameter.numel() != hf_parameter.numel():
-                    raise RuntimeError(
-                        f"parameter shape mismatch for {xtuner_name}: "
-                        f"{full_parameter.shape} vs {hf_parameter.shape}"
-                    )
-                with torch.no_grad():
-                    hf_parameter.copy_(
-                        full_parameter.reshape_as(hf_parameter), non_blocking=True
-                    )
-            except Exception as error:
-                sync_error = f"{type(error).__name__}: {error}"
-        del full_parameter
-    status = [sync_error]
-    torch.cuda.synchronize()
-    dist.broadcast_object_list(status, src=0)
-    if status[0] is not None:
-        raise RuntimeError(f"XTuner-to-HF parameter sync failed: {status[0]}")
-
-
-def _run_synchronized_full_steps(
+def _run_independent_full_steps(
     model: Any,
     parameters: dict[str, Any],
-    mapping: dict[str, str],
     hf_path: Path,
     batches: list[Any],
     rank: int,
     args: argparse.Namespace,
 ) -> int:
-    """Train XTuner continuously and compare HF at the same pre-update weights.
-
-    Small backward differences change first-step Adam signs, so independent
-    optimizer trajectories stop comparing the same parameter point. XTuner
-    owns the trajectory here. Rank 0 evaluates eager HF before each optimizer
-    step, then receives the updated XTuner weights for the following step.
-    """
+    """Train XTuner and HF with independent AdamW states and parameter trajectories."""
     import torch
     import torch.distributed as dist
 
     optimizer = _build_optimizer(parameters.values(), args)
+    if args.kernel_path == "production":
+        # Compile XTuner while its production environment is still active. Rank 0
+        # switches to the HF numerical environment below, after which lazy tracing
+        # would otherwise select HF operators inside XTuner's compiled graph.
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        optimizer.zero_grad(set_to_none=True)
+        warmup_input_ids = batches[0].cuda()
+        warmup_logits = forward_alignment.xtuner_train_logits(model, warmup_input_ids)
+        warmup_loss, _ = forward_alignment.mean_ce(warmup_logits, warmup_input_ids)
+        warmup_loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        del warmup_logits, warmup_loss, warmup_input_ids
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 0:
+            print("xtuner production compile warmup complete", flush=True)
+
     hf_model = None
-    hf_parameters = None
+    hf_optimizer = None
     if rank == 0:
         _configure_hf_numerical_reference()
         hf_model = forward_alignment.load_hf(hf_path)
@@ -560,10 +536,7 @@ def _run_synchronized_full_steps(
         hf_model.train()
         for parameter in hf_model.parameters():
             parameter.requires_grad_(True)
-        hf_parameters = dict(hf_model.named_parameters())
-        missing = set(mapping.values()).difference(hf_parameters)
-        if missing:
-            raise RuntimeError(f"HF model is missing mapped parameters: {sorted(missing)[:5]}")
+        hf_optimizer = _build_optimizer(hf_model.parameters(), args)
     dist.barrier()
 
     failed_steps = 0
@@ -582,7 +555,8 @@ def _run_synchronized_full_steps(
 
         if rank == 0:
             assert hf_model is not None
-            hf_model.zero_grad(set_to_none=True)
+            assert hf_optimizer is not None
+            hf_optimizer.zero_grad(set_to_none=True)
             torch.manual_seed(args.seed + step)
             torch.cuda.manual_seed_all(args.seed + step)
             hf_logits = forward_alignment.hf_train_logits(hf_model, input_ids.cuda())
@@ -612,18 +586,18 @@ def _run_synchronized_full_steps(
                 flush=True,
             )
             del hf_logits, hf_loss_tensor
+            hf_optimizer.step()
 
         dist.barrier()
         optimizer.step()
         torch.cuda.synchronize()
-        _sync_hf_parameters_from_xtuner(parameters, mapping, hf_parameters, rank)
         dist.barrier()
 
     result = [failed_steps]
     dist.broadcast_object_list(result, src=0)
     del optimizer
     if rank == 0:
-        del hf_model, hf_parameters
+        del hf_model, hf_optimizer
         gc.collect()
         torch.cuda.empty_cache()
     return int(result[0])
@@ -839,10 +813,9 @@ def main() -> None:
             full_parameters=args.full_parameters,
         )
         if args.full_parameters:
-            failed_steps = _run_synchronized_full_steps(
+            failed_steps = _run_independent_full_steps(
                 model,
                 selected_parameters,
-                mapping,
                 hf_path,
                 batches,
                 rank,
