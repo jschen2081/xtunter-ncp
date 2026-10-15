@@ -21,10 +21,11 @@ from typing import Literal, Self, cast
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from pydantic import model_validator
 from torch import Tensor, nn
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from tqdm import tqdm
 from typing_extensions import override
@@ -117,6 +118,57 @@ def _context_from_lengths(
         num_padding=0,
         device=device,
         position_ids=cast(torch.LongTensor, _arange_positions(lengths, device)),
+    )
+
+
+def _gather_sequence(hidden_states: Tensor, sp_mesh: DeviceMesh | None) -> Tensor:
+    if sp_mesh is None or sp_mesh.size() == 1:
+        return hidden_states
+    gathered = distF.all_gather(hidden_states.contiguous(), group=sp_mesh.get_group())
+    return torch.cat(gathered, dim=1).contiguous()
+
+
+def _split_sequence(hidden_states: Tensor, sp_mesh: DeviceMesh | None) -> Tensor:
+    if sp_mesh is None or sp_mesh.size() == 1:
+        return hidden_states
+    if hidden_states.shape[1] % sp_mesh.size():
+        raise ValueError(
+            f"sequence length ({hidden_states.shape[1]}) must be divisible by SP size ({sp_mesh.size()})"
+        )
+    shard_size = hidden_states.shape[1] // sp_mesh.size()
+    shard_start = sp_mesh.get_local_rank() * shard_size
+    return hidden_states[:, shard_start : shard_start + shard_size].contiguous()
+
+
+def _sp_context_from_lengths(
+    inputs_embeds: Tensor,
+    lengths: list[int],
+    sp_mesh: DeviceMesh,
+    chunk_size: int = 1,
+) -> SequenceContext:
+    total_length = sum(lengths)
+    if total_length != inputs_embeds.shape[1] * sp_mesh.size():
+        raise ValueError("SP context local tensor does not cover the global packed sequence")
+    if total_length % (sp_mesh.size() * chunk_size):
+        raise ValueError("SP context length must preserve chunk-aligned equal shards")
+    cu = torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device=inputs_embeds.device)
+    full_positions = _arange_positions(lengths, inputs_embeds.device)
+    shard_size = inputs_embeds.shape[1]
+    shard_start = sp_mesh.get_local_rank() * shard_size
+    return SequenceContext(
+        input_ids=None,
+        inputs_embeds=cast(torch.FloatTensor, inputs_embeds),
+        cu_seq_lens_q=cast(torch.IntTensor, cu),
+        cu_seq_lens_k=cast(torch.IntTensor, cu),
+        max_length_q=max(lengths),
+        max_length_k=max(lengths),
+        num_padding=0,
+        device=inputs_embeds.device,
+        position_ids=cast(torch.LongTensor, full_positions[:, shard_start : shard_start + shard_size]),
+        sequence_parallel_mesh=sp_mesh,
+        shard_start=shard_start,
+        shard_size=shard_size,
+        valid_sequence_length=total_length,
     )
 
 
@@ -727,28 +779,103 @@ class ConceptLMQwen35V2(BaseModel):
         torch._dynamo.maybe_mark_dynamic(seq_ctx.cu_seq_lens_q, dim)
         torch._dynamo.maybe_mark_dynamic(seq_ctx.cu_seq_lens_k, dim)
 
+    @staticmethod
+    def _original_document_lengths(seq_ctx: SequenceContext) -> list[int]:
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        if sp_mesh is None or sp_mesh.size() == 1:
+            return document_lengths(seq_ctx)
+        valid_length = seq_ctx.valid_sequence_length
+        boundaries = [int(value) for value in seq_ctx.cu_seq_lens_q.detach().cpu().tolist()]
+        logical_boundaries = [value for value in boundaries if value <= valid_length]
+        if not logical_boundaries or logical_boundaries[0] != 0:
+            logical_boundaries.insert(0, 0)
+        if logical_boundaries[-1] != valid_length:
+            logical_boundaries.append(valid_length)
+        return [end - start for start, end in zip(logical_boundaries[:-1], logical_boundaries[1:], strict=True)]
+
     def _token_context(
         self, seq_ctx: SequenceContext, orig_lengths: list[int]
-    ) -> tuple[SequenceContext, list[int]]:
+    ) -> tuple[SequenceContext, list[int], list[int]]:
         config = self.config
         padded_lengths = _hf_padded_lengths(orig_lengths, config.concept_chunk_size)
-        if padded_lengths == orig_lengths:
-            return seq_ctx, padded_lengths
-        if seq_ctx.input_ids is None:
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        use_sp = sp_mesh is not None and sp_mesh.size() > 1
+        if padded_lengths == orig_lengths and not use_sp:
+            return seq_ctx, padded_lengths, padded_lengths
+        input_ids = seq_ctx.raw_input_ids if use_sp else seq_ctx.input_ids
+        if input_ids is None:
             raise ValueError("v2 pads short documents with pad_token_id and needs input_ids")
         pieces: list[Tensor] = []
         start = 0
         pad_id = config.pad_token_id if config.pad_token_id is not None else config.eos_token_id
         for orig, padded in zip(orig_lengths, padded_lengths, strict=True):
-            document = seq_ctx.input_ids[:, start : start + orig]
+            document = input_ids[:, start : start + orig]
             start += orig
             if padded > orig:
                 pad = document.new_full((1, padded - orig), pad_id)
                 document = torch.cat((document, pad), dim=1)
             pieces.append(document)
         input_ids = torch.cat(pieces, dim=1)
-        token_ctx = _context_from_lengths(input_ids, None, padded_lengths, input_ids.device)
-        return token_ctx, padded_lengths
+        compute_lengths = list(padded_lengths)
+        if not use_sp:
+            token_ctx = _context_from_lengths(input_ids, None, compute_lengths, input_ids.device)
+            return token_ctx, padded_lengths, compute_lengths
+
+        assert sp_mesh is not None
+        alignment = sp_mesh.size() * config.concept_chunk_size
+        tail_padding = (-input_ids.shape[1]) % alignment
+        if tail_padding:
+            input_ids = torch.cat((input_ids, input_ids.new_full((1, tail_padding), pad_id)), dim=1)
+            # Keep the logical document count identical to the non-SP path.
+            # Treating alignment padding as a synthetic document changes the
+            # packed-kernel branch (notably GDN's cu_seqlens path), and those
+            # per-layer numerical differences are amplified by the full model.
+            # Extending the final document is causal-safe: appended tokens
+            # cannot affect its valid prefix.
+            compute_lengths[-1] += tail_padding
+        local_input_ids = _split_sequence(input_ids, sp_mesh)
+        full_positions = _arange_positions(compute_lengths, input_ids.device)
+        local_positions = _split_sequence(full_positions, sp_mesh)
+        cu = torch.tensor([0, *accumulate(compute_lengths)], dtype=torch.int32, device=input_ids.device)
+        shard_size = local_input_ids.shape[1]
+        shard_start = seq_ctx.sp_rank * shard_size
+        token_ctx = SequenceContext(
+            input_ids=cast(torch.LongTensor, local_input_ids),
+            inputs_embeds=None,
+            cu_seq_lens_q=cast(torch.IntTensor, cu),
+            cu_seq_lens_k=cast(torch.IntTensor, cu),
+            max_length_q=max(compute_lengths),
+            max_length_k=max(compute_lengths),
+            num_padding=0,
+            sequence_parallel_mesh=sp_mesh,
+            device=input_ids.device,
+            position_ids=cast(torch.LongTensor, local_positions),
+            raw_input_ids=cast(torch.LongTensor, input_ids),
+            shard_start=shard_start,
+            shard_size=shard_size,
+            valid_sequence_length=sum(compute_lengths),
+        )
+        return token_ctx, padded_lengths, compute_lengths
+
+    @staticmethod
+    def _restore_output_shard(
+        hidden_states: Tensor,
+        seq_ctx: SequenceContext,
+        orig_lengths: list[int],
+        padded_lengths: list[int],
+    ) -> Tensor:
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        full_hidden = _gather_sequence(hidden_states, sp_mesh)
+        cropped = _crop_documents(full_hidden, orig_lengths, padded_lengths)
+        if sp_mesh is None or sp_mesh.size() == 1:
+            return cropped
+        if seq_ctx.input_ids is None:
+            raise ValueError("SP output restoration requires the original local input shard")
+        output_length = seq_ctx.input_ids.shape[1] * sp_mesh.size()
+        if cropped.shape[1] < output_length:
+            padding = cropped.new_zeros(cropped.shape[0], output_length - cropped.shape[1], cropped.shape[2])
+            cropped = torch.cat((cropped, padding), dim=1)
+        return _split_sequence(cropped, sp_mesh)
 
     def forward(  # type: ignore[override]
         self,
@@ -757,30 +884,40 @@ class ConceptLMQwen35V2(BaseModel):
         return_intermediates: bool = False,
     ) -> DenseModelOutputs | tuple[DenseModelOutputs, dict[str, torch.Tensor]]:
         config = self.config
-        if seq_ctx.sequence_parallel_mesh is not None and seq_ctx.sequence_parallel_mesh.size() > 1:
-            raise NotImplementedError("ConceptLM Qwen3.5 v2 does not support sequence parallel")
-        orig_lengths = document_lengths(seq_ctx)
-        token_ctx, doc_lengths = self._token_context(seq_ctx, orig_lengths)
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        orig_lengths = self._original_document_lengths(seq_ctx)
+        token_ctx, padded_lengths, compute_lengths = self._token_context(seq_ctx, orig_lengths)
         input_ids = token_ctx.input_ids
         if input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = seq_ctx.inputs_embeds
+            hidden_states = token_ctx.inputs_embeds
         assert hidden_states is not None
         self._mark_dynamic(token_ctx)
         chunk_size = config.concept_chunk_size
 
         encoder_hidden, encoder_raw = self.encoder(hidden_states, token_ctx)
-        concept_hidden, concept_lengths = merge_chunks(
-            encoder_hidden, doc_lengths, chunk_size, config.concept_chunk_merge_method
-        )
-        concept_ctx = _context_from_lengths(None, concept_hidden, concept_lengths, concept_hidden.device)
         encoder_summaries = tuple(
             encoder_raw[index] for index in _block_end_indices(len(encoder_raw), config.cross_mudd_block_size)
         )
+        full_encoder_sources = tuple(
+            _gather_sequence(source, sp_mesh) for source in (hidden_states, *encoder_summaries)
+        )
+        full_encoder_hidden = _gather_sequence(encoder_hidden, sp_mesh)
+        full_concept_hidden, concept_lengths = merge_chunks(
+            full_encoder_hidden, compute_lengths, chunk_size, config.concept_chunk_merge_method
+        )
+        concept_hidden = _split_sequence(full_concept_hidden, sp_mesh)
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            concept_ctx = _sp_context_from_lengths(concept_hidden, concept_lengths, sp_mesh)
+        else:
+            concept_ctx = _context_from_lengths(None, concept_hidden, concept_lengths, concept_hidden.device)
         encoder_cross_bank = tuple(
-            merge_chunks(source, doc_lengths, chunk_size, config.concept_chunk_merge_method)[0]
-            for source in (hidden_states, *encoder_summaries)
+            _split_sequence(
+                merge_chunks(source, compute_lengths, chunk_size, config.concept_chunk_merge_method)[0],
+                sp_mesh,
+            )
+            for source in full_encoder_sources
         )
         predicted_hidden, predictor_raw = self.predictor(
             concept_hidden,
@@ -791,8 +928,16 @@ class ConceptLMQwen35V2(BaseModel):
         predicted = torch.einsum(
             "bshn,hnd->bshd", prediction_logits.softmax(dim=-1), torch.stack(tuple(self.codebooks))
         ).flatten(-2)
-        expanded = expand_concepts(
-            predicted, doc_lengths, concept_lengths, chunk_size, config.concept_shift_feature
+        full_predicted = _gather_sequence(predicted, sp_mesh)
+        expanded = _split_sequence(
+            expand_concepts(
+                full_predicted,
+                compute_lengths,
+                concept_lengths,
+                chunk_size,
+                config.concept_shift_feature,
+            ),
+            sp_mesh,
         )
         decoder_input = self.fusion_encoder_norm(encoder_hidden) + (
             self.fusion_alpha * self.fusion_repeated_norm(expanded)
@@ -801,7 +946,16 @@ class ConceptLMQwen35V2(BaseModel):
             predictor_raw[index] for index in _block_end_indices(len(predictor_raw), config.cross_mudd_block_size)
         )
         predictor_bank = tuple(
-            expand_concepts(source, doc_lengths, concept_lengths, chunk_size, config.concept_shift_feature)
+            _split_sequence(
+                expand_concepts(
+                    _gather_sequence(source, sp_mesh),
+                    compute_lengths,
+                    concept_lengths,
+                    chunk_size,
+                    config.concept_shift_feature,
+                ),
+                sp_mesh,
+            )
             for source in (concept_hidden, *predictor_summaries)
         )
         decoder_hidden, _ = self.decoder(
@@ -810,7 +964,7 @@ class ConceptLMQwen35V2(BaseModel):
             cross_banks=((hidden_states, *encoder_summaries), predictor_bank),
             aligned_predicted_concept=expanded,
         )
-        hidden_states = _crop_documents(decoder_hidden, orig_lengths, doc_lengths)
+        hidden_states = self._restore_output_shard(decoder_hidden, seq_ctx, orig_lengths, padded_lengths)
 
         output: dict = {}
         intermediates = {

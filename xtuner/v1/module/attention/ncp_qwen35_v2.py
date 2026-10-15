@@ -18,11 +18,64 @@ from xtuner.v1.config import GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module.rope import RopeScalingConfig
+from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.ops.gated_deltanet.gen_seq_idx import gen_seq_idx
 
 from ..linear import build_linear
 from ..rms_norm.ncp_qwen35_v2 import ZeroCenteredRMSNorm, env_on
 from .attn_outputs import AttnOutputs
+
+
+# Keep separate call sites until the Q/K/V collectives are fused. Dynamo otherwise
+# reuses one callable with incompatible tensor shapes across MLA and GDN.
+def _mla_query_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=2, gather_dim=1, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _mla_key_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=2, gather_dim=1, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _mla_value_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=2, gather_dim=1, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _mla_output_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _gdn_query_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _gdn_key_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _gdn_value_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _gdn_decay_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _gdn_beta_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
+
+
+def _gdn_output_all_to_all(x: Tensor, seq_ctx: SequenceContext) -> Tensor:
+    assert seq_ctx.sequence_parallel_mesh is not None
+    return ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=seq_ctx.sequence_parallel_mesh)
 
 
 class NCPQwen35V2MLAConfig(BaseModel):
@@ -251,8 +304,20 @@ class NCPQwen35V2MLA(nn.Module):
         ).expand(-1, -1, self.num_heads, -1)
         query = torch.cat((self.q_content_norm(query_content), query_pos), dim=-1)
         key = torch.cat((self.k_content_norm(key), key_pos), dim=-1)
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            if self.num_heads % sp_mesh.size():
+                raise ValueError(
+                    f"MLA heads ({self.num_heads}) must be divisible by SP size ({sp_mesh.size()})"
+                )
+            query = _mla_query_all_to_all(query, seq_ctx)
+            key = _mla_key_all_to_all(key, seq_ctx)
+            value = _mla_value_all_to_all(value, seq_ctx)
         scale = 1.0 / math.sqrt(self.qk_head_dim + self.qk_pos_emb_head_dim)
-        raw_output = _causal_attention(query, key, value, seq_ctx, scale).reshape(*q_input.shape[:2], -1)
+        raw_output = _causal_attention(query, key, value, seq_ctx, scale)
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            raw_output = _mla_output_all_to_all(raw_output, seq_ctx)
+        raw_output = raw_output.reshape(*q_input.shape[:2], -1)
         return {"raw_output": raw_output, "projected_output": self.out_proj(raw_output)}
 
 
@@ -360,8 +425,31 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         z = F.linear(q_input, weights[3])
         beta = F.linear(q_input, weights[4])
         alpha = F.linear(q_input, weights[5])
-        qkv = torch.cat((query, key, value), dim=-1)
         weight = self.conv1d.weight.squeeze(1)
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            sp_size = sp_mesh.size()
+            if self.num_k_heads % sp_size or self.num_v_heads % sp_size:
+                raise ValueError(
+                    "GDN key/value heads "
+                    f"({self.num_k_heads}/{self.num_v_heads}) must be divisible by SP size ({sp_size})"
+                )
+            query = _gdn_query_all_to_all(query.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
+            key = _gdn_key_all_to_all(key.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
+            value = _gdn_value_all_to_all(value.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
+            query_weight, key_weight, value_weight = weight.split(
+                (self.key_dim, self.key_dim, self.value_dim), dim=0
+            )
+            rank = seq_ctx.sp_rank
+            weight = torch.cat(
+                (
+                    query_weight.chunk(sp_size, dim=0)[rank],
+                    key_weight.chunk(sp_size, dim=0)[rank],
+                    value_weight.chunk(sp_size, dim=0)[rank],
+                ),
+                dim=0,
+            )
+        qkv = torch.cat((query, key, value), dim=-1)
         seq_idx = gen_seq_idx(qkv.shape[1], seq_ctx.cu_seq_lens_q)
         if qkv.is_cuda:
             from xtuner.v1.ops.gated_deltanet import get_causal_conv1d_fn
@@ -371,16 +459,21 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
             )
         else:
             qkv = _cpu_conv_documents(qkv, self.conv1d, seq_ctx.cu_seq_lens_q)
-        query_key, value = qkv.split((2 * self.key_dim, self.value_dim), dim=-1)
-        query_key = query_key.reshape(*qkv.shape[:2], 2 * self.num_k_heads, self.head_k_dim)
-        value = value.reshape(*qkv.shape[:2], self.num_v_heads, self.head_v_dim)
+        sp_size = sp_mesh.size() if sp_mesh is not None else 1
+        local_key_dim = self.key_dim // sp_size
+        local_value_dim = self.value_dim // sp_size
+        query_key, value = qkv.split((2 * local_key_dim, local_value_dim), dim=-1)
+        local_k_heads = self.num_k_heads // sp_size
+        local_v_heads = self.num_v_heads // sp_size
+        query_key = query_key.reshape(*qkv.shape[:2], 2 * local_k_heads, self.head_k_dim)
+        value = value.reshape(*qkv.shape[:2], local_v_heads, self.head_v_dim)
         use_kernel_qk_l2 = qkv.is_cuda and self.use_fused_qk_l2
         if not use_kernel_qk_l2:
             query_key = query_key.float() * torch.rsqrt(
                 query_key.float().square().sum(-1, keepdim=True) + 1.0e-6
             )
             query_key = query_key.to(qkv.dtype)
-        query, key = query_key.split(self.num_k_heads, dim=2)
+        query, key = query_key.split(local_k_heads, dim=2)
         repeats = self.num_v_heads // self.num_k_heads
         query = query.repeat_interleave(repeats, dim=2)
         key = key.repeat_interleave(repeats, dim=2)
@@ -388,6 +481,9 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         dt_bias = self.dt_bias.to_local() if isinstance(self.dt_bias, DTensor) else self.dt_bias
         decay = -a_log.float().exp() * F.softplus(alpha.float() + dt_bias)
         beta = beta.sigmoid()
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            decay = _gdn_decay_all_to_all(decay.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
+            beta = _gdn_beta_all_to_all(beta.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
         if qkv.is_cuda:
             from xtuner.v1.ops.gated_deltanet import get_chunk_gated_delta_rule_fn
 
@@ -402,6 +498,8 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
             )
         else:
             output = _cpu_delta_documents(query, key, value, decay, beta, seq_ctx.cu_seq_lens_q)
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            output = _gdn_output_all_to_all(output, seq_ctx)
         gate = z.reshape_as(output)
         if output.is_cuda and self.use_fused_norm_gate:
             gated = _fused_zero_rms_norm_gate(output, gate, self.out_norm.weight, self.out_norm.eps)

@@ -32,11 +32,12 @@ def ulysses_all_to_all(
     input_split_sizes = [split_size] * world_size
     output_split_sizes = input_split_sizes
 
-    input = input.contiguous()
     # Here, only movedim can be used, not transpose. Otherwise, it will lead to
     # a bug "ValueError: Tensors must be contiguous" in torch compile mode.
     # (a bug of torch compile)
-    input = input.movedim(scatter_dim, 0)
+    # ``movedim`` itself returns a view, so materialize contiguity after moving
+    # the scatter dimension to satisfy functional collectives on newer PyTorch.
+    input = input.movedim(scatter_dim, 0).contiguous()
 
     output = _all_to_all_single_autograd(
         input,
