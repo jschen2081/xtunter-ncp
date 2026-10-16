@@ -3,6 +3,7 @@ set -Eeuo pipefail
 A="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 R="$(cd "$A/../../../.." && pwd)"
 OUT="${1:?Pass prepared output directory}"
+shift
 KEEP=/mnt/shared-storage-user/llmrazor-share/heqiushi/gpu_keepalive/gpu_keepalive.sh
 export PATH="/usr/bin:$PATH" PYTHONPATH="$R" OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
 exec 9>"$OUT/runner.lock"
@@ -35,7 +36,7 @@ git rev-parse HEAD > "$OUT/xtuner_commit.txt"
 git diff HEAD --binary > "$OUT/xtuner_source.patch"
 cp "$A/replay_xtuner.py" "$OUT/replay_xtuner.executed.py"
 echo RUNNING > "$OUT/status"
-ALIGNMENT_RUN_DIR="$OUT" bash "$A/run_xtuner.sh" --recompute-ratio 0 --compile
+ALIGNMENT_RUN_DIR="$OUT" bash "$A/run_xtuner.sh" --recompute-ratio 0 --compile "$@"
 echo 0 > "$OUT/training_exit_code"
 echo COMPARING > "$OUT/status"
 if [[ -f "$OUT/conversion_manifest.json" ]]; then
