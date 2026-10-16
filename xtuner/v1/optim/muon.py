@@ -323,6 +323,7 @@ class Muon(Optimizer):
         remainder_strategy: Literal["agrs", "pad_all2all"] = "agrs",
         muon_split_sizes: dict[Tensor, tuple[int, ...]] | None = None,
         muon_qkv_split_shapes: dict[Tensor, tuple[int, int, int]] | None = None,
+        pre_orthogonalize_fn: Callable | None = None,
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -356,6 +357,7 @@ class Muon(Optimizer):
         )
         super().__init__(params, defaults)
         self._enable_all2all = enable_all2all
+        self._pre_orthogonalize_fn = pre_orthogonalize_fn
         self._remainder_strategy = remainder_strategy
         self._muon_split_sizes = muon_split_sizes or {}
         self._muon_qkv_split_shapes = muon_qkv_split_shapes or {}
@@ -811,6 +813,7 @@ class Muon(Optimizer):
                                 shard_dim=sharded_tensor_dim,
                                 process_group=group_process_group,
                                 num_experts=ns_num_experts,
+                                pre_orthogonalize_fn=self._pre_orthogonalize_fn,
                             )
                         )
 
@@ -848,6 +851,7 @@ class Muon(Optimizer):
                                 shard_dim=sharded_tensor_dim,
                                 process_group=comm_pg,
                                 num_experts=ns_num_experts,
+                                pre_orthogonalize_fn=self._pre_orthogonalize_fn,
                             )
                         )
 
@@ -914,6 +918,7 @@ def muon_update_batch_async(
     process_group: ProcessGroup | None = None,  # Unified process group for communication
     num_experts: int = 1,  # Number of experts for MoE models
     batch_size: int | None = None,  # If set, pad X/G/M to this size with zeros
+    pre_orthogonalize_fn: Callable | None = None,
 ) -> Generator[None, None, None]:
     """Batched version of Muon update.
 
@@ -944,7 +949,8 @@ def muon_update_batch_async(
         assert len(X) == world_size
 
     # Update momentum and compute the inputs for orthogonalization
-    U = muon_update_pre_orthogonalize(
+    prepare_update = muon_update_pre_orthogonalize if pre_orthogonalize_fn is None else pre_orthogonalize_fn
+    U = prepare_update(
         G=maybe_to_local(G),
         M=maybe_to_local(M),
         momentum=momentum,

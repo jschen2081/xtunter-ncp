@@ -8,7 +8,7 @@ from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
 from typing_extensions import Annotated
 
-from xtuner.v1.optim import LocalDTensorAdamW, Muon, SwapAdamW
+from xtuner.v1.optim import LocalDTensorAdamW, MegatronMuon, Muon, SwapAdamW
 from xtuner.v1.utils import get_logger
 
 
@@ -141,6 +141,9 @@ class AdamWConfig(OptimConfig):
 
 
 class MuonConfig(OptimConfig):
+    megatron_compatible: Annotated[
+        bool, Parameter(help="Use Megatron EMA, quintic NS and model-owned semantic projection layouts")
+    ] = False
     weight_decay: Annotated[float, Parameter(help="Weight decay coefficient for L2 regularization")] = 0.1
     momentum: Annotated[float, Parameter(help="Momentum coefficients for Muon optimizer")] = 0.95
     betas: Annotated[Tuple[float, float], Parameter(help="Beta coefficients for AdamW optimizer")] = (0.9, 0.95)
@@ -150,7 +153,7 @@ class MuonConfig(OptimConfig):
     ] = "rms_norm"
     extra_scale_factor: Annotated[
         float,
-        Parameter(help="Multiplier for rms_norm. 0.2 is the historical rms ratio; 1 matches Megatron spectral."),
+        Parameter(help="Multiplier for rms_norm: scale * sqrt(max(rows, cols)); 0.2 matches this Megatron recipe."),
     ] = 0.2
     enable_all2all: Annotated[
         bool, Parameter(help="Allow all-to-all comm strategy; set False on topologies where all-to-all is unreliable")
@@ -178,6 +181,14 @@ class MuonConfig(OptimConfig):
 
         muon_split_sizes = {}
         muon_qkv_split_shapes = {}
+        metadata = {}
+        if self.megatron_compatible:
+            provider = getattr(model, "get_muon_metadata", None)
+            if callable(provider):
+                metadata = provider()
+                muon_split_sizes.update(metadata.get("split_sizes", {}))
+        param_options = metadata.get("param_options", {})
+        explicit_adamw_params = {}
         for module in model.modules():
             get_muon_split_sizes = getattr(module, "get_muon_split_sizes", None)
             if callable(get_muon_split_sizes):
@@ -221,6 +232,13 @@ class MuonConfig(OptimConfig):
             num_total += n
             if name in trainable_names:
                 num_total_requires_grad += n
+                if p in param_options:
+                    options = param_options[p]
+                    if options["algorithm"] != "adamw":
+                        raise ValueError("Explicit Muon fallback options must specify AdamW")
+                    explicit_adamw_params.setdefault(options["weight_decay"], []).append(p)
+                    num_adamw += n
+                    continue
                 # we want to avoid using Muon for 1D-tensors, as well as embed_tokens and lm_head.
                 # effectively-1D tensors where one dimension accounts for all elements (e.g. shape [1, D]) should
                 # also be excluded, and hence the `p.numel() not in p.shape` condition.
@@ -301,6 +319,9 @@ class MuonConfig(OptimConfig):
             )
 
         # Sanity check: ensure all trainable parameters are assigned to optimizer
+        for decay, parameters in explicit_adamw_params.items():
+            param_groups.append(dict(params=parameters, algorithm="adamw", clip_grad=True,
+                                     adamw_foreach=self.adamw_foreach, weight_decay=decay))
         total_assigned = (
             len(muon_params_regular)
             + len(muon_params_moe_fused_w1w3)
@@ -308,6 +329,7 @@ class MuonConfig(OptimConfig):
             + len(adamw_params)
             + len(adamw_embed_params)
             + len(adamw_1d_params)
+            + sum(len(parameters) for parameters in explicit_adamw_params.values())
         )
         total_trainable = len(trainable_names)
         assert total_assigned == total_trainable, (
@@ -336,7 +358,11 @@ class MuonConfig(OptimConfig):
                 )
             logger.info(f"Untrainable parameters names: {untrainable_names}")
 
-        optimizer = Muon(
+        optimizer_cls = MegatronMuon if self.megatron_compatible else Muon
+        optimizer_kwargs = {}
+        if self.megatron_compatible:
+            optimizer_kwargs["muon_adamw_ranges"] = metadata.get("adamw_ranges", {})
+        optimizer = optimizer_cls(
             param_groups,
             lr=self.lr,
             mu=self.momentum,
@@ -351,6 +377,7 @@ class MuonConfig(OptimConfig):
             enable_all2all=self.enable_all2all,
             muon_split_sizes=muon_split_sizes,
             muon_qkv_split_shapes=muon_qkv_split_shapes,
+            **optimizer_kwargs,
         )
 
         return optimizer

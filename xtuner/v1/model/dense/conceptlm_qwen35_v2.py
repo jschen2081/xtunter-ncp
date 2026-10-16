@@ -33,6 +33,7 @@ from typing_extensions import override
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss import BaseLossContext
+from xtuner.v1.loss.conceptlm_loss import ConceptLMLossConfig, ConceptLMLossContext
 from xtuner.v1.model.base import DEFAULT_FLOAT8_CFG, BaseModel, HFSaveCfg, TorchCompileOption
 from xtuner.v1.model.utils import apply_activation_checkpointing
 from xtuner.v1.module import LMHead, RMSNorm
@@ -649,6 +650,7 @@ class ConceptLMQwen35V2Config(Qwen3_5_VLTextDense9BConfig):
     # residual VQ
     concept_codebook_size: int = 128
     concept_num_codebooks: int = 32
+    concept_loss_cfg: ConceptLMLossConfig | None = None
     mla_num_heads: int = 24
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512
@@ -688,6 +690,8 @@ class ConceptLMQwen35V2Config(Qwen3_5_VLTextDense9BConfig):
             raise ValueError("v2 requires positive MUDD block sizes")
         if self.qk_pos_emb_head_dim % 2:
             raise ValueError("MLA positional head dim must be even")
+        if self.concept_loss_cfg is not None and self.concept_loss_cfg.concept_chunk_size != self.concept_chunk_size:
+            raise ValueError("ConceptLM loss and model chunk sizes must agree")
         return self
 
     def build(self) -> "ConceptLMQwen35V2":  # type: ignore[override]
@@ -878,6 +882,48 @@ class ConceptLMQwen35V2(BaseModel):
             cropped = torch.cat((cropped, padding), dim=1)
         return _split_sequence(cropped, sp_mesh)
 
+    def get_muon_metadata(self):
+        """Model-owned physical projection layouts and scalar fallback options."""
+        splits, gates, scalar = {}, {}, {}
+        for name, param in self.named_parameters():
+            if name.endswith((".post_norm", ".post_norm_weight", ".static_weight", ".static_logits")):
+                scalar[param] = 0.0
+            elif name.endswith(".attention.conv1d.weight") or name == "fusion_alpha":
+                # Megatron conv is 3D, xTuner stores its equivalent 2D kernel.
+                # Megatron fusion_alpha is 0D (weight decay enabled), xTuner is [1].
+                scalar[param] = 0.1
+        for module in self.modules():
+            kind = type(module).__name__
+            # FSDP/checkpoint wrappers expose the underlying modules during traversal.
+            if "NCPQwen35V2MLA" in kind and hasattr(module, "q_up"):
+                splits[module.q_up.weight] = (module.qk_head_dim + module.qk_pos_emb_head_dim,) * module.num_heads
+                splits[module.kv_up.weight] = (module.qk_head_dim, module.v_head_dim) * module.num_heads
+                splits[module.kv_down.weight] = (module.kv_lora_rank, module.qk_pos_emb_head_dim)
+            elif "NCPQwen35V2GatedDeltaNet" in kind and hasattr(module, "in_proj"):
+                rows = ((module.head_k_dim,) * (2 * module.num_k_heads)
+                        + (module.head_v_dim,) * module.num_v_heads)
+                splits[module.in_proj.weight] = rows
+                # [Q heads | K heads | V heads | z | beta | alpha].
+                gates[module.in_proj.weight] = (sum(rows), module.in_proj.weight.shape[0])
+            elif "FusedSwiGLUMLP" in kind and hasattr(module, "fc1"):
+                width = module.fc1.weight.shape[0] // 2
+                splits[module.fc1.weight] = (width, width)
+            elif kind.endswith(("SelfMUDDRoute", "CrossMUDDRoute")):
+                streams = getattr(module, "compute_streams", 4)
+                splits[module.router_w2.weight] = (module.num_sources,) * streams
+        return {"split_sizes": splits, "adamw_ranges": gates,
+                "param_options": {param: {"algorithm": "adamw", "weight_decay": decay}
+                                  for param, decay in scalar.items()}}
+
+    def build_loss_ctx_batch(self, data_batch, sp_mesh=None):
+        contexts = super().build_loss_ctx_batch(data_batch, sp_mesh)
+        if self.config.concept_loss_cfg is not None:
+            auxiliary = [self.config.concept_loss_cfg.build(data, sp_mesh) for data in data_batch]
+            auxiliary = ConceptLMLossContext.build_batches(auxiliary)
+            for context, aux_ctx in zip(contexts, auxiliary):
+                context["concept"] = aux_ctx
+        return contexts
+
     def forward(  # type: ignore[override]
         self,
         seq_ctx: SequenceContext,
@@ -980,6 +1026,12 @@ class ConceptLMQwen35V2(BaseModel):
             output["logits"] = logits
         else:
             lm_loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx["lm"])  # type: ignore[call-overload]
+            if self.config.concept_loss_cfg is not None:
+                if "concept" not in loss_ctx:
+                    raise ValueError("Build ConceptLM loss contexts with model.build_loss_ctx_batch")
+                auxiliary, statistics = loss_ctx["concept"](concept_hidden, predicted, self.codebooks)
+                lm_loss = lm_loss + auxiliary
+                extra_info.update(statistics)
             output["loss"] = lm_loss
             output["logits"] = logits
             output["extra_info"] = extra_info
