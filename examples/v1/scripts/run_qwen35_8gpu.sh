@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+ulimit -n 65536
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BASE=/mnt/shared-storage-user/llmrazor-share/heqiushi
 DATA_PATH="${DATA_PATH:-/mnt/shared-storage-gpfs2/plm-gpfs/public_data_model/data/dolma3_mix-150B-1025/megatron_qwen35_8192/indexed}"
@@ -34,7 +35,7 @@ echo "OUTPUT=$OUT"
   examples/v1/scripts/megatron_alignment/train_qwen35.py \
   --run-dir "$OUT" --data-format "$FORMAT" --data-path "$DATA_PATH" \
   --text-manifest "$MANIFEST" --data-cache "$CACHE/tokenization" \
-  --zero-stage 2 --gradient-accumulation-no-sync --compile --recompute-ratio 0 \
+  --zero-stage 2 --sp-size "${SP_SIZE:-1}" --gradient-accumulation-no-sync --compile --recompute-ratio 0 \
   --steps "${TRAIN_ITERS:-100}" --global-batch-size "${GLOBAL_BATCH_SIZE:-128}" \
   --sequence-length "${SEQ_LENGTH:-8192}" --seed "${SEED:-1234}" \
   --lr "${LR:-8e-4}" --min-lr "${MIN_LR:-8e-5}" \

@@ -18,9 +18,11 @@ class XTunerTextSource:
         rank (int): Data parallel rank.
         world (int): Data parallel world size.
         output (Path): Training output directory.
+        dp_mesh: Optional native data-parallel mesh. SP peers use identical
+            DP-local ranks and therefore consume identical full samples.
     """
 
-    def __init__(self, config: dict[str, Any], rank: int, world: int, output: Path) -> None:
+    def __init__(self, config: dict[str, Any], rank: int, world: int, output: Path, *, dp_mesh=None) -> None:
         from torch.distributed.device_mesh import init_device_mesh
         from transformers import AutoTokenizer
         from xtuner.v1.datasets import PretrainTokenizeFunctionConfig
@@ -51,7 +53,9 @@ class XTunerTextSource:
             num_workers=config["num_workers"], pack_workers=config["pack_workers"],
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        mesh = init_device_mesh(device, (world,), mesh_dim_names=("text_dp",))
+        mesh = dp_mesh if dp_mesh is not None else init_device_mesh(device, (world,), mesh_dim_names=("text_dp",))
+        if mesh.size() != world or mesh.get_local_rank() != rank:
+            raise ValueError("Data source rank/size must match the DP mesh")
         self.loader = self.loader_config.build(
             tokenizer=tokenizer, dp_mesh=mesh, global_batch_size=config["global_batch_size"],
             micro_batch_size=1, seed=config["seed"], shuffle=True, total_step=config["steps"],
@@ -60,6 +64,7 @@ class XTunerTextSource:
             raise ValueError("The supplied text contains no complete hard packs")
         self.iterator = iter(self.loader)
         self.metadata = dict(dataset_class="MegatronIndexedDataset" if indexed else "JsonlDataset",
+                             dp_size=world, sp_size=config.get("sp_size", 1),
                              packing_class="fixed_token_stream_blocks" if indexed else "HardPackDataset",
                              sampler_class=type(self.loader.sampler).__name__, shuffle=True,
                              global_pack=not indexed, eos_added=not indexed, model_sequence_length=config["sequence_length"],

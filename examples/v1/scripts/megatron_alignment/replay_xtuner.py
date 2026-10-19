@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=3)
     parser.add_argument("--gradient-accumulation-no-sync", action="store_true")
     parser.add_argument("--profile-trace", action="store_true")
+    parser.add_argument("--sp-size", type=int, choices=(1, 8), default=1)
     args = parser.parse_args()
     contract = json.loads((args.run_dir / "contract.json").read_text())
     args.hf_path = Path(contract["hf_path"])
@@ -26,7 +27,7 @@ def main():
                 for rank in range(8)]
     if not complete[0] or any(item != complete[0] for item in complete):
         raise ValueError("Megatron capture is incomplete or ranks consumed different steps")
-    result_path = args.run_dir / "xtuner_sp1.jsonl"
+    result_path = args.run_dir / f"xtuner_sp{args.sp_size}.jsonl"
     if result_path.exists():
         raise FileExistsError(f"Use a fresh capture directory: {result_path}")
     sys.path.insert(0, str(args.xtuner_root))
@@ -56,18 +57,25 @@ def main():
         print(f"ATTENTION_BACKEND {attention_backend}", flush=True)
     # Match the production Muon fp32 matmul policy.
     torch.set_float32_matmul_precision("medium")
+    from torch.distributed.device_mesh import init_device_mesh
+    mesh = init_device_mesh("cuda", (world // args.sp_size, args.sp_size), mesh_dim_names=("replay_dp", "replay_sp"))
+    sp_mesh = mesh["replay_sp"]
+    source_ranks = range((rank // args.sp_size) * args.sp_size, (rank // args.sp_size + 1) * args.sp_size)
+    paths = sorted(path for source_rank in source_ranks
+                   for path in (args.run_dir / "batches").glob(f"*.rank{source_rank:02d}.pt"))
     grouped = {}
-    for path in sorted((args.run_dir / "batches").glob(f"*.rank{rank:02d}.pt")):
+    for path in paths:
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        validate_batch(payload, rank, world)
+        validate_batch(payload, payload["rank"], world)
         grouped.setdefault(payload["step"], []).append(payload)
     actual_counts = {str(step): len(items) for step, items in grouped.items()}
-    if actual_counts != complete[rank]:
+    if actual_counts != {step: count * args.sp_size for step, count in complete[rank].items()}:
         raise ValueError("Captured batches differ from successful Megatron completion record")
     for step, payloads in grouped.items():
-        payloads.sort(key=lambda value: value["micro"])
+        payloads.sort(key=lambda value: (value["micro"], value["rank"]))
         expected = payloads[0]["global_batch_size"] // world
-        if [p["micro"] for p in payloads] != list(range(expected)):
+        if [(p["micro"], p["rank"]) for p in payloads] != [
+                (micro, source_rank) for micro in range(expected) for source_rank in source_ranks]:
             raise ValueError(f"Missing/duplicate microbatches in step {step}")
         if any(p["lr"] != payloads[0]["lr"] or p["global_batch_size"] != payloads[0]["global_batch_size"]
                for p in payloads):
@@ -102,7 +110,7 @@ def main():
             xtuner_repository=str(args.xtuner_root.resolve()),
             xtuner_commit=subprocess.check_output(
                 ["git", "-C", str(args.xtuner_root), "rev-parse", "HEAD"], text=True).strip(),
-            sp_size=1, world_size=world, recompute_ratio=args.recompute_ratio, compile=args.compile,
+            sp_size=args.sp_size, world_size=world, recompute_ratio=args.recompute_ratio, compile=args.compile,
             zero_stage=args.zero_stage, reshard_after_forward=engine.fsdp_cfg.reshard_after_forward,
             gradient_accumulation_no_sync=engine.fsdp_cfg.gradient_accumulation_no_sync,
             attention_backend=attention_backend, use_fa3=os.environ.get("XTUNER_USE_FA3", "0") == "1",
@@ -137,12 +145,14 @@ def main():
                 if not torch.equal(context.position_ids, payload["position_ids"].cuda()):
                     raise ValueError("Position IDs differ from production")
                 labels = payload["labels"].cuda().masked_fill(payload["loss_mask"].cuda() == 0, -100)
+                if args.sp_size > 1:
+                    context = context.split(sp_mesh)
                 batches.append(dict(seq_ctx=context, shifted_labels=labels, loss_mask=payload["loss_mask"].cuda()))
             target_count = sum(b["shifted_labels"].ne(-100).sum() for b in batches)
             dist.all_reduce(target_count)
             if target_count.item() <= 0:
                 raise ValueError("No effective training tokens")
-            contexts = engine.model.build_loss_ctx_batch(batches)
+            contexts = engine.model.build_loss_ctx_batch(batches, sp_mesh=sp_mesh if args.sp_size > 1 else None)
             items = []
             for batch, context in zip(batches, contexts):
                 items.append(ModelItem(seq_ctx=batch["seq_ctx"], loss_ctx=context))
@@ -167,10 +177,15 @@ def main():
             total_loss = stats[0].item() / world
             vq, hlm = (4 * stats[1:] / target_count).tolist()
             fingerprints = [None] * world
-            dist.all_gather_object(fingerprints, [p["sha256"] for p in payloads])
-            row = dict(step=step, total_loss=total_loss, lm_loss=total_loss - vq - hlm,
+            if args.sp_size == 1:
+                dist.all_gather_object(fingerprints, [p["sha256"] for p in payloads])
+            else:
+                fingerprints = [[p["sha256"] for p in payloads if p["rank"] == source_rank]
+                                for source_rank in range(world)]
+            row = dict(step=step, sp_size=args.sp_size, accumulation_steps=len(payloads),
+                       total_loss=total_loss, lm_loss=total_loss - vq - hlm,
                        vq_token_loss=vq, hlm_token_loss=hlm, grad_norm=float(grad_norm),
-                       lr=payloads[0]["lr"], valid_targets=int(target_count),
+                       lr=payloads[0]["lr"], valid_targets=int(target_count) // args.sp_size,
                        batch_sha256_by_rank=fingerprints, seconds=float(elapsed),
                        peak_memory_gib=torch.cuda.max_memory_allocated() / 2**30,
                        tokens_per_second_per_gpu=payloads[0]["global_batch_size"] *

@@ -17,6 +17,7 @@ def main() -> None:
     parser.add_argument("--recompute-ratio", type=float, default=1.0)
     parser.add_argument("--compile", action="store_true", help="Enable the model default torch.compile configuration")
     parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=3)
+    parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--gradient-accumulation-no-sync", action="store_true")
     parser.add_argument("--profile-trace", action="store_true")
     base = Path("/mnt/shared-storage-user/llmrazor-share/heqiushi")
@@ -42,8 +43,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--pack-workers", type=int, default=1)
     args = parser.parse_args()
-    if args.steps <= 0 or args.global_batch_size <= 0 or args.sequence_length % 4:
-        parser.error("steps and GBS must be positive; sequence length must be divisible by 4")
+    if args.steps <= 0 or args.global_batch_size <= 0 or args.sequence_length <= 0 or args.sequence_length % (4 * args.sp_size):
+        parser.error("steps, GBS and sequence length must be positive; sequence length must be divisible by 4 * SP size")
     result_path = args.run_dir / "train_metrics.jsonl"
     if args.run_dir.exists():
         raise FileExistsError(f"Use a fresh output directory: {args.run_dir}")
@@ -54,6 +55,7 @@ def main() -> None:
     _configure_kernels()
     import torch
     import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
     from xtuner.v1.config import FSDPConfig, MuonConfig
     from xtuner.v1.data_proto import SequenceContext
     from xtuner.v1.engine.train_engine import TrainEngine
@@ -65,7 +67,13 @@ def main() -> None:
     dist.init_process_group("cpu:gloo,cuda:nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     if world != 8:
-        raise ValueError("Comparison requires exactly eight ranks, SP1")
+        raise ValueError("This entry requires exactly eight ranks")
+    dp_size = world // args.sp_size
+    if args.global_batch_size % dp_size:
+        raise ValueError("GBS must be divisible by the data parallel size")
+    data_mesh = init_device_mesh("cuda", (dp_size, args.sp_size), mesh_dim_names=("data_dp", "data_sp"))
+    dp_mesh, sp_mesh = data_mesh["data_dp"], data_mesh["data_sp"]
+    accumulation_steps = args.global_batch_size // dp_size
     from xtuner.v1.ops.flash_attn import flash_attn_varlen_func
     attention_backend = flash_attn_varlen_func.__name__
     if os.environ.get("XTUNER_USE_FA3", "0") == "1" and attention_backend != "gpu_flash_varlen_attn_v3":
@@ -74,17 +82,20 @@ def main() -> None:
         print(f"ATTENTION_BACKEND {attention_backend}", flush=True)
     # Match the production Muon fp32 matmul policy.
     torch.set_float32_matmul_precision("medium")
-    if args.global_batch_size % world:
-        raise ValueError("GBS must be divisible by eight data parallel ranks")
     if rank == 0:
         args.run_dir.mkdir(parents=True)
     dist.barrier()
     training_config = {key: str(value) if isinstance(value, Path) else value
                      for key, value in vars(args).items()}
+    training_config.update(dp_size=dp_size, world_size=world, gradient_accumulation_steps=accumulation_steps)
     if rank == 0:
         (args.run_dir / "training_config.json").write_text(json.dumps(training_config, indent=2))
         (args.run_dir / "status").write_text("INITIALIZING_DATA\n")
-    data_source = XTunerTextSource(training_config, rank, world, args.run_dir)
+    data_source = XTunerTextSource(
+        training_config, dp_mesh.get_local_rank(), dp_size, args.run_dir, dp_mesh=dp_mesh,
+    )
+    if rank == 0:
+        print(f"PARALLELISM dp={dp_size} sp={args.sp_size} accumulation={accumulation_steps}", flush=True)
     if rank == 0:
         (args.run_dir / "data_contract.json").write_text(json.dumps(data_source.metadata, indent=2))
     _seed_step(args.seed)
@@ -112,7 +123,9 @@ def main() -> None:
             xtuner_repository=str(args.xtuner_root.resolve()),
             xtuner_commit=subprocess.check_output(
                 ["git", "-C", str(args.xtuner_root), "rev-parse", "HEAD"], text=True).strip(),
-            sp_size=1, world_size=world, recompute_ratio=args.recompute_ratio, compile=args.compile,
+            sp_size=args.sp_size, dp_size=dp_size, world_size=world,
+            gradient_accumulation_steps=accumulation_steps,
+            recompute_ratio=args.recompute_ratio, compile=args.compile,
             zero_stage=args.zero_stage, reshard_after_forward=engine.fsdp_cfg.reshard_after_forward,
             gradient_accumulation_no_sync=engine.fsdp_cfg.gradient_accumulation_no_sync,
             attention_backend=attention_backend, use_fa3=os.environ.get("XTUNER_USE_FA3", "0") == "1",
@@ -142,6 +155,13 @@ def main() -> None:
             (args.run_dir / "status").write_text("RUNNING\n")
         for step in range(args.steps):
             payloads = data_source.next_step(step)
+            if args.sp_size > 1:
+                # Native ParallelSampler uses the DP-local rank, so SP peers
+                # read the same full samples. Check before model collectives.
+                peer_batches = [None] * args.sp_size
+                dist.all_gather_object(peer_batches, [p["sha256"] for p in payloads], group=sp_mesh.get_group())
+                if any(value != peer_batches[0] for value in peer_batches):
+                    raise ValueError("SP peers sampled different full sequences")
             batches = []
             for payload in payloads:
                 tokens = payload["tokens"].cuda()
@@ -150,13 +170,19 @@ def main() -> None:
                 context = SequenceContext.from_input_ids(documents, device="cuda")
                 if not torch.equal(context.position_ids, payload["position_ids"].cuda()):
                     raise ValueError("Position IDs differ from production")
+                if args.sp_size > 1:
+                    context = context.split(sp_mesh)
                 labels = payload["labels"].cuda().masked_fill(payload["loss_mask"].cuda() == 0, -100)
                 batches.append(dict(seq_ctx=context, shifted_labels=labels, loss_mask=payload["loss_mask"].cuda()))
             target_count = sum(b["shifted_labels"].ne(-100).sum() for b in batches)
             dist.all_reduce(target_count)
+            # Full labels are shared by SP peers; count each target once in logs.
+            if target_count.item() % args.sp_size:
+                raise ValueError("Replicated target count is not divisible by SP size")
+            target_count = target_count // args.sp_size
             if target_count.item() <= 0:
                 raise ValueError("No effective training tokens")
-            contexts = engine.model.build_loss_ctx_batch(batches)
+            contexts = engine.model.build_loss_ctx_batch(batches, sp_mesh=sp_mesh if args.sp_size > 1 else None)
             items = []
             for batch, context in zip(batches, contexts):
                 items.append(ModelItem(seq_ctx=batch["seq_ctx"], loss_ctx=context))
@@ -182,12 +208,14 @@ def main() -> None:
                                  info["extra_info"]["concept_hlm_numerator"].sum()))
             dist.all_reduce(stats)
             total_loss = stats[0].item() / world
-            vq, hlm = (4 * stats[1:] / target_count).tolist()
+            # Auxiliary numerators use full gathered features on each SP peer.
+            vq, hlm = (4 * stats[1:] / (target_count * args.sp_size)).tolist()
             fingerprints = [None] * world
             dist.all_gather_object(fingerprints, [p["sha256"] for p in payloads])
             row = dict(step=step, total_loss=total_loss, lm_loss=total_loss - vq - hlm,
                        vq_token_loss=vq, hlm_token_loss=hlm, grad_norm=float(grad_norm),
                        lr=applied_lr, valid_targets=int(target_count),
+                       sp_size=args.sp_size, dp_size=dp_size, gradient_accumulation_steps=accumulation_steps,
                        batch_sha256_by_rank=fingerprints, seconds=float(elapsed),
                        peak_memory_gib=torch.cuda.max_memory_allocated() / 2**30,
                        tokens_per_second_per_gpu=payloads[0]["global_batch_size"] *

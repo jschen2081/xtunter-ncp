@@ -1029,7 +1029,11 @@ class ConceptLMQwen35V2(BaseModel):
             if self.config.concept_loss_cfg is not None:
                 if "concept" not in loss_ctx:
                     raise ValueError("Build ConceptLM loss contexts with model.build_loss_ctx_batch")
-                auxiliary, statistics = loss_ctx["concept"](concept_hidden, predicted, self.codebooks)
+                auxiliary, statistics = loss_ctx["concept"](
+                    full_concept_hidden if sp_mesh is not None and sp_mesh.size() > 1 else concept_hidden,
+                    full_predicted if sp_mesh is not None and sp_mesh.size() > 1 else predicted,
+                    self.codebooks,
+                )
                 lm_loss = lm_loss + auxiliary
                 extra_info.update(statistics)
             output["loss"] = lm_loss

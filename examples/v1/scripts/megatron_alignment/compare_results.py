@@ -8,7 +8,7 @@ def rows(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def compare(root):
+def compare(root, sp_size=1):
     done = json.loads((root / "xtuner_complete.json").read_text())
     production = {}
     rank_counts = []
@@ -34,7 +34,7 @@ def compare(root):
         raise ValueError("Megatron rank step counts differ")
     optimizer_rows = rows(root / "megatron_steps.jsonl")
     optimizer = {row["step"]: row for row in optimizer_rows}
-    actual = rows(root / "xtuner_sp1.jsonl")
+    actual = rows(root / f"xtuner_sp{sp_size}.jsonl")
     steps = [row["step"] for row in actual]
     if (steps != sorted(production) or steps != done["steps"] or
             steps != sorted(optimizer) or len(optimizer_rows) != len(steps)):
@@ -74,8 +74,9 @@ def compare(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--sp-size", type=int, choices=(1, 8), default=1)
     args = parser.parse_args()
-    report = compare(args.run_dir)
+    report = compare(args.run_dir, args.sp_size)
     (args.run_dir / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 

@@ -52,9 +52,9 @@ class ConceptLMLossConfig(BaseLossConfig):
 
     def build(self, data, sp_mesh=None):
         seq_ctx = data["seq_ctx"]
-        mesh = sp_mesh if sp_mesh is not None else seq_ctx.sequence_parallel_mesh
-        if mesh is not None and mesh.size() > 1:
-            raise NotImplementedError("ConceptLM auxiliary losses currently require SP1")
+        # Auxiliary loss uses full gathered concept features and full token masks.
+        # SP replicas intentionally count replicated masks in WORLD calibration;
+        # this balances differentiable WORLD reduction and FSDP gradient averaging.
         labels = data["shifted_labels"]
         mask = data.get("loss_mask", labels.ne(self.ignore_idx))
         if mask.shape != labels.shape or mask.ndim != 2 or mask.shape[0] != 1:
