@@ -11,6 +11,7 @@ import pytest
 import torch
 from pydantic import BaseModel
 
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "examples/v1/scripts/megatron_alignment"
 sys.path.insert(0, str(SCRIPTS))
@@ -19,7 +20,7 @@ from recorded_batch_source import RecordedBatchSource, batch_path, capture_metad
 from replay_xtuner import collect_replay, main  # noqa: E402
 
 
-def make_capture(root: Path, steps: int = 3, micros: int = 2) -> dict[str, int]:
+def make_capture(root: Path, steps: int = 3, micros: int = 2, length: int = 16) -> dict[str, int]:
     (root / "batches").mkdir(parents=True)
     (root / "contract.json").write_text(json.dumps({"hf_path": "/unused/weights", "tokenizer": "/unused/tokenizer"}))
     for rank in range(8):
@@ -27,13 +28,13 @@ def make_capture(root: Path, steps: int = 3, micros: int = 2) -> dict[str, int]:
         (root / f"megatron_complete.rank{rank:02d}.json").write_text(json.dumps(completed))
         for step in range(steps):
             for micro in range(micros):
-                tokens = torch.arange(16)[None] + rank * 32 + step * 256 + micro * 1024
-                mask = torch.ones(1, 16)
+                tokens = torch.arange(length)[None] + rank * 32 + step * 256 + micro * 1024
+                mask = torch.ones(1, length)
                 mask[0, 4] = 0
                 payload = {
                     "tokens": tokens, "labels": tokens + 1, "loss_mask": mask,
-                    "position_ids": torch.arange(8).repeat(2)[None],
-                    "cu_seqlens": torch.tensor([0, 8, 16], dtype=torch.int32),
+                    "position_ids": torch.arange(length // 2).repeat(2)[None],
+                    "cu_seqlens": torch.tensor([0, length // 2, length], dtype=torch.int32),
                     "step": step, "micro": micro, "rank": rank, "world_size": 8,
                     "global_batch_size": 8 * micros, "lr": 123.456 + step, "packed": True,
                 }
@@ -60,29 +61,53 @@ CPUContext = native_context_class()
 def prepare(root: Path, monkeypatch: pytest.MonkeyPatch, *extra: str) -> dict[str, Any]:
     monkeypatch.setattr(sys, "argv", ["replay_xtuner.py", "--run-dir", str(root), *extra])
     main()
-    return json.loads((root / "xtuner_sp1_native/training_config.json").read_text())
+    sp_size = int(extra[extra.index("--sp-size") + 1]) if "--sp-size" in extra else 1
+    return json.loads((root / f"xtuner_sp{sp_size}_native/training_config.json").read_text())
 
 
 def native_outputs(root: Path, config: dict[str, Any]) -> None:
-    output = root / "xtuner_sp1_native"
+    sp_size = config["sp_size"]
+    output = root / f"xtuner_sp{sp_size}_native"
     for rank in range(8):
-        source = RecordedBatchSource(root, rank, config["capture_metadata"])
+        source = RecordedBatchSource(root, rank, config["capture_metadata"], sp_size)
         audits, rows = [], []
         for step in range(config["steps"]):
             payloads = source.next_update()
             audits.append({"step": step, "batch_sha256": [p["sha256"] for p in payloads],
-                           "valid_targets": 15 * config["microbatches_per_update"]})
+                           "valid_targets": (config["sequence_length"] - 1) * config["microbatches_per_update"] * sp_size})
             rows.append({
                 "step": step + 1, "lr": 8e-4 * step / 2000, "grad_norm": 2.0, "time/step_time": 0.5,
                 "loss/reduced_total_loss": 8.0, "loss/reduced_lm_loss": 5.0,
                 "loss/reduced_vq_token_loss": 1.0, "loss/reduced_hlm_token_loss": 2.0,
-                "loss/valid_targets": 15 * config["global_batch_size"],
+                "loss/valid_targets": (config["sequence_length"] - 1) * config["global_batch_size"],
             })
         (output / f"replay_inputs.rank{rank:02d}.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in audits))
         tracker = output / f"logs/exp_tracking/rank{rank}/tracker.jsonl"
         tracker.parent.mkdir(parents=True)
         tracker.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def adapter_namespace() -> dict[str, Any]:
+    path = SCRIPTS / "replay_trainer_config.py"
+    tree = ast.parse(path.read_text())
+    tree.body = [node for node in tree.body if not (
+        isinstance(node, ast.ImportFrom) and (
+            node.module.startswith("xtuner.") or node.module in {"train_qwen35", "pydantic"}
+        )
+    )]
+    from pydantic import ConfigDict
+
+    class BaseConfig(BaseModel):
+        pack_level: str = "none"
+        pack_max_length: int = 17
+        pack_to_max_length: bool = True
+        group_by_length: bool = False
+
+    namespace = {"DataloaderConfig": BaseConfig, "BaseDataloader": object,
+                 "SequenceContext": CPUContext, "TrainerConfig": Any, "ConfigDict": ConfigDict}
+    exec(compile(tree, str(path), "exec"), namespace)
+    return namespace
 
 
 class TestNativeSP1Replay:
@@ -161,24 +186,7 @@ class TestNativeSP1Replay:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         metadata = make_capture(tmp_path)
-        path = SCRIPTS / "replay_trainer_config.py"
-        tree = ast.parse(path.read_text())
-        tree.body = [node for node in tree.body if not (
-            isinstance(node, ast.ImportFrom) and (
-                node.module.startswith("xtuner.") or node.module in {"train_qwen35", "pydantic"}
-            )
-        )]
-        from pydantic import ConfigDict
-
-        class BaseConfig(BaseModel):
-            pack_level: str = "none"
-            pack_max_length: int = 17
-            pack_to_max_length: bool = True
-            group_by_length: bool = False
-
-        namespace = {"DataloaderConfig": BaseConfig, "BaseDataloader": object,
-                     "SequenceContext": CPUContext, "TrainerConfig": Any, "ConfigDict": ConfigDict}
-        exec(compile(tree, str(path), "exec"), namespace)
+        namespace = adapter_namespace()
         monkeypatch.setenv("WORLD_SIZE", "8")
         namespace["build_trainer_config"] = lambda config: SimpleNamespace(native_trainer=True)
         namespace["flash_attn_varlen_func"] = SimpleNamespace(__name__="gpu_flash_varlen_attn_v3")

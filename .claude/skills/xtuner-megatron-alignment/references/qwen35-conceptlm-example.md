@@ -108,10 +108,10 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 
 | 文件 | 职责 |
 |---|---|
-| replay_xtuner.py / run_xtuner.sh | 生产batch/LR回放，八卡标准TrainEngine，SP1/SP8 |
+| replay_xtuner.py / run_xtuner.sh | 生产输入回放，SP1/SP8统一标准CLI → Trainer.fit；LR由xTuner scheduler独立计算 |
 | batch_contract.py | 元数据、dtype/shape/内容指纹和mask/边界检查 |
 | compare_results.py | completion、step/micro、targets、指纹、LR和误差报告 |
-| train_qwen35.py / xtuner_text_source.py / qwen35_wsd_lr.py | 独立native indexed/text数据和本地LR，无参考batch/LR依赖 |
+| train_qwen35.py / replay_trainer_config.py / recorded_batch_source.py | 原生Trainer配置与捕获数据适配；SP组内按(micro,原rank)顺序读取相同完整输入，交由Trainer切分 |
 | ../run_qwen35_v2_9b_8gpu.sh | 独立八卡入口，默认SP1，SP_SIZE=8或--sp-size 8 |
 | probe_xtuner_gradients.py / locate_xtuner_gradients.py / gradient_probe_utils.py / layer_gradient_trace.py / compare_gradient_location.py | 诊断工具，与正式训练分离 |
 
@@ -179,4 +179,4 @@ python "$XTUNER_ROOT/examples/v1/scripts/megatron_alignment/compare_results.py" 
   "$ALIGNMENT_RUN_DIR" --sp-size 1
 ```
 
-SP8回放传 --sp-size 8；独立训练用 SP_SIZE=8 bash examples/v1/scripts/run_qwen35_v2_9b_8gpu.sh。回放脚本和比较工具存在同名completion/config输出，配置不同应使用独立结果目录。历史转换工具可能固定100步/800batch/960参数，不应直接用于其他模型。
+SP8回放传 --sp-size 8，使用与SP1相同的Trainer入口，结果在xtuner_sp8_native/与xtuner_sp8.jsonl；不再使用单独SP8训练循环。GBS128时每卡累积128个MBS1输入，审计去除SP重复并还原原8个rank的指纹。独立训练用 SP_SIZE=8 bash examples/v1/scripts/run_qwen35_v2_9b_8gpu.sh。回放脚本和比较工具存在同名completion/config输出，配置不同应使用独立结果目录。TensorBoard与JSONL均记录原生训练指标，profiling默认关闭；LR只在结果比较时与Megatron核对。

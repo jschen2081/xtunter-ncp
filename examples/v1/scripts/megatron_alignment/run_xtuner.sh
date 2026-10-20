@@ -38,7 +38,7 @@ PY="${XTUNER_PYTHON:-python}"
 REPO="$(cd "$ALIGN_DIR/../../../.." && pwd)"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 "$PY" "$ALIGN_DIR/runtime_requirements.py"
-# Retain the existing SP8 loop until its separate migration.
+# Select the output directory for the shared native Trainer entry.
 sp_size=1
 arguments=("$@")
 for ((i=0; i<${#arguments[@]}; i++)); do
@@ -47,11 +47,7 @@ for ((i=0; i<${#arguments[@]}; i++)); do
     --sp-size=*) sp_size="${arguments[i]#*=}" ;;
   esac
 done
-if [[ "$sp_size" != 1 ]]; then
-  exec "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=8 \
-    "$ALIGN_DIR/replay_xtuner_sp8.py" --run-dir "$ALIGNMENT_RUN_DIR" "$@" "${runtime_args[@]}"
-fi
 "$PY" "$ALIGN_DIR/replay_xtuner.py" --run-dir "$ALIGNMENT_RUN_DIR" "$@" "${runtime_args[@]}"
 "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=8 \
-  -m xtuner.v1.train.cli.sft --config "$ALIGNMENT_RUN_DIR/xtuner_sp1_native/trainer_config.py"
-"$PY" "$ALIGN_DIR/replay_xtuner.py" --run-dir "$ALIGNMENT_RUN_DIR" --collect-metrics
+  -m xtuner.v1.train.cli.sft --config "$ALIGNMENT_RUN_DIR/xtuner_sp${sp_size}_native/trainer_config.py"
+"$PY" "$ALIGN_DIR/replay_xtuner.py" --run-dir "$ALIGNMENT_RUN_DIR" --sp-size "$sp_size" --collect-metrics
