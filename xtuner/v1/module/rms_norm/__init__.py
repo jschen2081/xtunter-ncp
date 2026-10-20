@@ -1,4 +1,4 @@
-from .ncp_qwen35_v2 import GatedDeltaNetInputRMSNorm, MuddRMSNorm, ZeroCenteredRMSNorm
+from .concept_qwen35 import GatedDeltaNetInputRMSNorm, MuddRMSNorm, ZeroCenteredRMSNorm
 from .rms_norm import RMSNorm
 
 

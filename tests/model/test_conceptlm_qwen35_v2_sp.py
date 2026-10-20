@@ -17,16 +17,16 @@ from torch.utils.hooks import RemovableHandle
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.model.dense.conceptlm_qwen35_v2 import (
+from xtuner.v1.model.dense.conceptlm_qwen35_9b import (
     ConceptLMQwen35V2,
     ConceptLMQwen35V2Config,
     _crop_documents,
     _hf_padded_lengths,
 )
-from xtuner.v1.module.attention.ncp_qwen35_v2 import NCPQwen35V2GatedDeltaNet, NCPQwen35V2MLA
+from xtuner.v1.module.attention.concept_qwen35 import NCPQwen35V2GatedDeltaNet, NCPQwen35V2MLA
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.fused_swiglu import FusedSwiGLUMLP
-from xtuner.v1.module.rms_norm.ncp_qwen35_v2 import (
+from xtuner.v1.module.rms_norm.concept_qwen35 import (
     GatedDeltaNetInputRMSNorm,
     MuddRMSNorm,
     ZeroCenteredRMSNorm,

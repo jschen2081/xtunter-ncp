@@ -14,7 +14,7 @@ from safetensors import safe_open
 
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
-from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2Config
+from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2Config
 
 
 NCP_QWEN35_V2_PATH = os.environ.get("NCP_QWEN35_V2_PATH")

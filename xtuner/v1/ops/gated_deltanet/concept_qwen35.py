@@ -41,7 +41,8 @@ def _zero_norm_gate_kernel(x, gate, weight, out, eps: tl.constexpr, width: tl.co
 
 @torch.library.custom_op("xtuner::ncp_v2_zero_norm_gate", mutates_args=())
 def zero_rms_norm_gate(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Fuse GDN normalization and SiLU while preserving the normalized BF16 boundary."""
+    """Fuse GDN normalization and SiLU while preserving the normalized BF16
+    boundary."""
     x, gate, weight = x.contiguous(), gate.contiguous(), weight.contiguous()
     out = torch.empty_like(x)
     width = x.shape[-1]
@@ -52,13 +53,13 @@ def zero_rms_norm_gate(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor
 
 
 @zero_rms_norm_gate.register_fake
-def _zero_rms_norm_gate_fake(
-    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
-) -> torch.Tensor:
+def _zero_rms_norm_gate_fake(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.empty_like(x)
 
 
-def _setup_context(ctx: Any, inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float], output: torch.Tensor) -> None:
+def _setup_context(
+    ctx: Any, inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float], output: torch.Tensor
+) -> None:
     x, gate, weight, ctx.eps = inputs
     ctx.save_for_backward(x, gate, weight)
 

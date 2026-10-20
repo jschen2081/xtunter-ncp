@@ -37,7 +37,7 @@ from xtuner.v1.loss.conceptlm_loss import ConceptLMLossConfig, ConceptLMLossCont
 from xtuner.v1.model.base import DEFAULT_FLOAT8_CFG, BaseModel, HFSaveCfg, TorchCompileOption
 from xtuner.v1.model.utils import apply_activation_checkpointing
 from xtuner.v1.module import LMHead, RMSNorm
-from xtuner.v1.module.attention.ncp_qwen35_v2 import (
+from xtuner.v1.module.attention.concept_qwen35 import (
     NCPQwen35V2GatedDeltaNetConfig,
     NCPQwen35V2MLAConfig,
 )
@@ -45,12 +45,18 @@ from xtuner.v1.module.concept_sequence import document_lengths, expand_concepts,
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.fused_swiglu import FusedSwiGLUMLP
 from xtuner.v1.module.linear import build_linear
-from xtuner.v1.module.rms_norm.ncp_qwen35_v2 import (
+from xtuner.v1.module.rms_norm.concept_qwen35 import (
     GatedDeltaNetInputRMSNorm,
     MuddRMSNorm,
     ZeroCenteredRMSNorm,
+)
+from xtuner.v1.module.rms_norm.concept_qwen35 import (
     effective_weight as _effective_weight,
+)
+from xtuner.v1.module.rms_norm.concept_qwen35 import (
     env_on as _env_on,
+)
+from xtuner.v1.module.rms_norm.concept_qwen35 import (
     mudd_rms_norm as _mudd_rms_norm,
 )
 from xtuner.v1.utils import get_device, log_rank0
@@ -71,14 +77,10 @@ Streams = tuple[Tensor, Tensor, Tensor, Tensor]
 _MAX_CROSS_MUDD_SOURCES = 25
 
 CONCEPTLM_QWEN35_V2_COMPILE_CFG: dict[str, TorchCompileOption] = {
-    "xtuner.v1.module.decoder_layer.dense_decoder_layer.DenseDecoderLayer.forward": TorchCompileOption(
-        fullgraph=True
-    ),
-    "xtuner.v1.model.dense.conceptlm_qwen35_v2.SelfMUDDRoute.forward": TorchCompileOption(fullgraph=True),
-    "xtuner.v1.model.dense.conceptlm_qwen35_v2.CrossMUDDRoute.forward": TorchCompileOption(fullgraph=True),
-    "xtuner.v1.model.dense.conceptlm_qwen35_v2.PredictedConceptInjection.forward": TorchCompileOption(
-        fullgraph=True
-    ),
+    "xtuner.v1.module.decoder_layer.dense_decoder_layer.DenseDecoderLayer.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.model.dense.conceptlm_qwen35_9b.SelfMUDDRoute.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.model.dense.conceptlm_qwen35_9b.CrossMUDDRoute.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.model.dense.conceptlm_qwen35_9b.PredictedConceptInjection.forward": TorchCompileOption(fullgraph=True),
     **DEFAULT_FLOAT8_CFG,
 }
 
@@ -133,9 +135,7 @@ def _split_sequence(hidden_states: Tensor, sp_mesh: DeviceMesh | None) -> Tensor
     if sp_mesh is None or sp_mesh.size() == 1:
         return hidden_states
     if hidden_states.shape[1] % sp_mesh.size():
-        raise ValueError(
-            f"sequence length ({hidden_states.shape[1]}) must be divisible by SP size ({sp_mesh.size()})"
-        )
+        raise ValueError(f"sequence length ({hidden_states.shape[1]}) must be divisible by SP size ({sp_mesh.size()})")
     shard_size = hidden_states.shape[1] // sp_mesh.size()
     shard_start = sp_mesh.get_local_rank() * shard_size
     return hidden_states[:, shard_start : shard_start + shard_size].contiguous()
@@ -185,7 +185,10 @@ def _crop_documents(hidden: Tensor, orig_lengths: list[int], padded_lengths: lis
 
 
 class SelfMUDDRoute(nn.Module):
-    """Block self-MUDD. Parameter names and shapes match ``model.mudd.routes.*``."""
+    """Block self-MUDD.
+
+    Parameter names and shapes match ``model.mudd.routes.*``.
+    """
 
     def __init__(self, hidden_size: int, layer_index: int, depth: int, block_size: int, eps: float) -> None:
         super().__init__()
@@ -223,7 +226,10 @@ class SelfMUDDRoute(nn.Module):
 
 
 class CrossMUDDRoute(nn.Module):
-    """Four-role cross route. The mix is added onto the current self-MUDD streams."""
+    """Four-role cross route.
+
+    The mix is added onto the current self-MUDD streams.
+    """
 
     def __init__(self, hidden_size: int, num_sources: int, eps: float) -> None:
         super().__init__()
@@ -262,8 +268,8 @@ class CrossMUDDRoute(nn.Module):
         sources = tuple(_mudd_rms_norm(source, self.source_norm_weight, self.eps) for source in candidate_pool)
         outputs: list[Tensor] = []
         for role, stream in enumerate(streams):
-            mixed = sum(
-                source * weights[..., role, index : index + 1] for index, source in enumerate(sources)
+            mixed = cast(
+                Tensor, sum(source * weights[..., role, index : index + 1] for index, source in enumerate(sources))
             )
             delta = gates[role] * _mudd_rms_norm(mixed, self.post_norm_weight[role], self.eps)
             outputs.append(stream + delta)
@@ -322,7 +328,10 @@ def _triton_dual_cross_mudd_streams(
     eps1: float,
     streams: Streams,
 ) -> Streams:
-    """Fused decoder Cross-MUDD pair. Two mixes, one post-norm residual kernel."""
+    """Fused decoder Cross-MUDD pair.
+
+    Two mixes, one post-norm residual kernel.
+    """
     raise RuntimeError("Triton dual Cross-MUDD requires CUDA and triton")
 
 
@@ -341,9 +350,35 @@ if triton is not None:
     def _cross_mudd_scaled_fwd(
         weights,
         scale,
-        s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12,
-        s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24,
-        out0, out1, out2, out3,
+        s0,
+        s1,
+        s2,
+        s3,
+        s4,
+        s5,
+        s6,
+        s7,
+        s8,
+        s9,
+        s10,
+        s11,
+        s12,
+        s13,
+        s14,
+        s15,
+        s16,
+        s17,
+        s18,
+        s19,
+        s20,
+        s21,
+        s22,
+        s23,
+        s24,
+        out0,
+        out1,
+        out2,
+        out3,
         nsrc: tl.constexpr,
         hidden: tl.constexpr,
         block: tl.constexpr,
@@ -351,8 +386,31 @@ if triton is not None:
         fp16: tl.constexpr,
     ):
         sources = (
-            s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12,
-            s13, s14, s15, s16, s17, s18, s19, s20, s21, s22, s23, s24,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+            s8,
+            s9,
+            s10,
+            s11,
+            s12,
+            s13,
+            s14,
+            s15,
+            s16,
+            s17,
+            s18,
+            s19,
+            s20,
+            s21,
+            s22,
+            s23,
+            s24,
         )
         row = tl.program_id(0)
         hidden_block = tl.program_id(1)
@@ -369,12 +427,8 @@ if triton is not None:
             if nsrc > source_index:
                 source = tl.load(sources[source_index] + pointer, mask=mask, other=0)
                 scaled = _cross_mudd_mul(source, learned_scale, bf16, fp16)
-                value0 += _cross_mudd_mul(
-                    scaled, tl.load(weights + weight_pointer + source_index), bf16, fp16
-                )
-                value1 += _cross_mudd_mul(
-                    scaled, tl.load(weights + weight_pointer + nsrc + source_index), bf16, fp16
-                )
+                value0 += _cross_mudd_mul(scaled, tl.load(weights + weight_pointer + source_index), bf16, fp16)
+                value1 += _cross_mudd_mul(scaled, tl.load(weights + weight_pointer + nsrc + source_index), bf16, fp16)
                 value2 += _cross_mudd_mul(
                     scaled, tl.load(weights + weight_pointer + 2 * nsrc + source_index), bf16, fp16
                 )
@@ -388,8 +442,14 @@ if triton is not None:
 
     @triton.jit
     def _cross_mudd_dual_post_gate_residual_fwd(
-        update0, update1, current,
-        post_scale0, post_scale1, gate0, gate1, output,
+        update0,
+        update1,
+        current,
+        post_scale0,
+        post_scale1,
+        gate0,
+        gate1,
+        output,
         hidden: tl.constexpr,
         block: tl.constexpr,
         eps0: tl.constexpr,
@@ -449,10 +509,7 @@ if triton is not None:
 
         def prepare_sources(candidate_pool: tuple[Tensor, ...], eps: float) -> tuple[Tensor, ...]:
             return tuple(
-                (
-                    source
-                    * torch.rsqrt(source.float().square().mean(dim=-1, keepdim=True) + eps).to(source.dtype)
-                )
+                (source * torch.rsqrt(source.float().square().mean(dim=-1, keepdim=True) + eps).to(source.dtype))
                 .reshape(-1, hidden)
                 .contiguous()
                 for source in candidate_pool
@@ -471,31 +528,57 @@ if triton is not None:
         mix_block = min(256, triton.next_power_of_2(hidden))
         launch = (weight_matrix0.shape[0], triton.cdiv(hidden, mix_block))
         _cross_mudd_scaled_fwd[launch](
-            weight_matrix0, source_scale0.contiguous(), *source_pointers0, *mixed0,
-            nsrc=nsrc0, hidden=hidden, block=mix_block,
-            bf16=weights0.dtype == torch.bfloat16, fp16=weights0.dtype == torch.float16, num_warps=4,
+            weight_matrix0,
+            source_scale0.contiguous(),
+            *source_pointers0,
+            *mixed0,
+            nsrc=nsrc0,
+            hidden=hidden,
+            block=mix_block,
+            bf16=weights0.dtype == torch.bfloat16,
+            fp16=weights0.dtype == torch.float16,
+            num_warps=4,
         )
         _cross_mudd_scaled_fwd[launch](
-            weight_matrix1, source_scale1.contiguous(), *source_pointers1, *mixed1,
-            nsrc=nsrc1, hidden=hidden, block=mix_block,
-            bf16=weights1.dtype == torch.bfloat16, fp16=weights1.dtype == torch.float16, num_warps=4,
+            weight_matrix1,
+            source_scale1.contiguous(),
+            *source_pointers1,
+            *mixed1,
+            nsrc=nsrc1,
+            hidden=hidden,
+            block=mix_block,
+            bf16=weights1.dtype == torch.bfloat16,
+            fp16=weights1.dtype == torch.float16,
+            num_warps=4,
         )
         stream_matrices = tuple(stream.reshape(-1, hidden).contiguous() for stream in streams)
         outputs = tuple(torch.empty_like(unit_sources0[0]) for _ in range(4))
         post_block = triton.next_power_of_2(hidden)
         for role in range(4):
             _cross_mudd_dual_post_gate_residual_fwd[(weight_matrix0.shape[0],)](
-                mixed0[role], mixed1[role], stream_matrices[role],
-                post_scale0[role].contiguous(), post_scale1[role].contiguous(),
-                gates0[role].contiguous(), gates1[role].contiguous(), outputs[role],
-                hidden=hidden, block=post_block, eps0=eps0, eps1=eps1,
-                bf16=weights0.dtype == torch.bfloat16, fp16=weights0.dtype == torch.float16, num_warps=8,
+                mixed0[role],
+                mixed1[role],
+                stream_matrices[role],
+                post_scale0[role].contiguous(),
+                post_scale1[role].contiguous(),
+                gates0[role].contiguous(),
+                gates1[role].contiguous(),
+                outputs[role],
+                hidden=hidden,
+                block=post_block,
+                eps0=eps0,
+                eps1=eps1,
+                bf16=weights0.dtype == torch.bfloat16,
+                fp16=weights0.dtype == torch.float16,
+                num_warps=8,
             )
         return cast(Streams, tuple(output.reshape(shape) for output in outputs))
 
 
 class ConceptLMQwen35V2Stack(nn.Module):
     """One tower: hybrid layers, block self-MUDD, optional cross routes and concept reads."""
+
+    _self_routes: nn.ModuleList
 
     def __init__(
         self,
@@ -599,8 +682,8 @@ class ConceptLMQwen35V2Stack(nn.Module):
             # Decoder has the encoder bank and the predictor bank. The fused kernel
             # applies both residual updates together, matching the HF dual path.
             if len(self.cross_route_groups) == 2 and _env_on("NCP_Q35V2_TRITON_DUAL_CROSS_MUDD"):
-                route0 = self.cross_route_groups[0][index]
-                route1 = self.cross_route_groups[1][index]
+                route0 = cast(CrossMUDDRoute, cast(nn.ModuleList, self.cross_route_groups[0])[index])
+                route1 = cast(CrossMUDDRoute, cast(nn.ModuleList, self.cross_route_groups[1])[index])
                 bank0, bank1 = cross_banks
                 if len(bank0) != route0.num_sources or len(bank1) != route1.num_sources:
                     raise ValueError("dual Cross-MUDD source count mismatch")
@@ -637,7 +720,10 @@ def _cross_source_count(num_layers: int, block_size: int) -> int:
 
 
 class ConceptLMQwen35V2Config(Qwen3_5_VLTextDense9BConfig):
-    """Qwen3.5-9B ConceptLM v2 recipe. Depths and MLA match the pinned HF checkpoint."""
+    """Qwen3.5-9B ConceptLM v2 recipe.
+
+    Depths and MLA match the pinned HF checkpoint.
+    """
 
     # stack depths
     concept_encoder_layers: int = 8
@@ -710,9 +796,7 @@ class ConceptLMQwen35V2(BaseModel):
         self.mudd = MUDDRoutes(config)
         encoder_sources = _cross_source_count(config.concept_encoder_layers, config.cross_mudd_block_size)
         predictor_sources = _cross_source_count(config.concept_predictor_layers, config.cross_mudd_block_size)
-        self.encoder = ConceptLMQwen35V2Stack(
-            config, config.concept_encoder_layers, self.mudd.routes["encoder"]
-        )
+        self.encoder = ConceptLMQwen35V2Stack(config, config.concept_encoder_layers, self.mudd.routes["encoder"])
         self.predictor = ConceptLMQwen35V2Stack(
             config,
             config.concept_predictor_layers,
@@ -807,7 +891,7 @@ class ConceptLMQwen35V2(BaseModel):
         use_sp = sp_mesh is not None and sp_mesh.size() > 1
         if padded_lengths == orig_lengths and not use_sp:
             return seq_ctx, padded_lengths, padded_lengths
-        input_ids = seq_ctx.raw_input_ids if use_sp else seq_ctx.input_ids
+        input_ids: Tensor | None = seq_ctx.raw_input_ids if use_sp else seq_ctx.input_ids
         if input_ids is None:
             raise ValueError("v2 pads short documents with pad_token_id and needs input_ids")
         pieces: list[Tensor] = []
@@ -883,7 +967,8 @@ class ConceptLMQwen35V2(BaseModel):
         return _split_sequence(cropped, sp_mesh)
 
     def get_muon_metadata(self):
-        """Model-owned physical projection layouts and scalar fallback options."""
+        """Model-owned physical projection layouts and scalar fallback
+        options."""
         splits, gates, scalar = {}, {}, {}
         for name, param in self.named_parameters():
             if name.endswith((".post_norm", ".post_norm_weight", ".static_weight", ".static_logits")):
@@ -900,8 +985,7 @@ class ConceptLMQwen35V2(BaseModel):
                 splits[module.kv_up.weight] = (module.qk_head_dim, module.v_head_dim) * module.num_heads
                 splits[module.kv_down.weight] = (module.kv_lora_rank, module.qk_pos_emb_head_dim)
             elif "NCPQwen35V2GatedDeltaNet" in kind and hasattr(module, "in_proj"):
-                rows = ((module.head_k_dim,) * (2 * module.num_k_heads)
-                        + (module.head_v_dim,) * module.num_v_heads)
+                rows = (module.head_k_dim,) * (2 * module.num_k_heads) + (module.head_v_dim,) * module.num_v_heads
                 splits[module.in_proj.weight] = rows
                 # [Q heads | K heads | V heads | z | beta | alpha].
                 gates[module.in_proj.weight] = (sum(rows), module.in_proj.weight.shape[0])
@@ -911,9 +995,11 @@ class ConceptLMQwen35V2(BaseModel):
             elif kind.endswith(("SelfMUDDRoute", "CrossMUDDRoute")):
                 streams = getattr(module, "compute_streams", 4)
                 splits[module.router_w2.weight] = (module.num_sources,) * streams
-        return {"split_sizes": splits, "adamw_ranges": gates,
-                "param_options": {param: {"algorithm": "adamw", "weight_decay": decay}
-                                  for param, decay in scalar.items()}}
+        return {
+            "split_sizes": splits,
+            "adamw_ranges": gates,
+            "param_options": {param: {"algorithm": "adamw", "weight_decay": decay} for param, decay in scalar.items()},
+        }
 
     def build_loss_ctx_batch(self, data_batch, sp_mesh=None):
         contexts = super().build_loss_ctx_batch(data_batch, sp_mesh)
@@ -1029,7 +1115,8 @@ class ConceptLMQwen35V2(BaseModel):
             if self.config.concept_loss_cfg is not None:
                 if "concept" not in loss_ctx:
                     raise ValueError("Build ConceptLM loss contexts with model.build_loss_ctx_batch")
-                auxiliary, statistics = loss_ctx["concept"](
+                concept_loss_ctx = cast(ConceptLMLossContext, loss_ctx["concept"])
+                auxiliary, statistics = concept_loss_ctx(
                     full_concept_hidden if sp_mesh is not None and sp_mesh.size() > 1 else concept_hidden,
                     full_predicted if sp_mesh is not None and sp_mesh.size() > 1 else predicted,
                     self.codebooks,
@@ -1080,7 +1167,7 @@ class ConceptLMQwen35V2(BaseModel):
 
             Float8Handler.pad_for_fsdp(
                 self,
-                self.fsdp_mesh,
+                cast(DeviceMesh, self.fsdp_mesh),
                 callback_after_pad=self._init_load_spec,
             )  # type: ignore[arg-type]
 

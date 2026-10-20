@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2Config
+from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2Config
 from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig
 from xtuner.v1.utils import HFCheckpointLoader
 
@@ -42,7 +42,7 @@ def _controlled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _use_sdpa_for_xtuner_mla(monkeypatch: pytest.MonkeyPatch) -> None:
-    import xtuner.v1.module.attention.ncp_qwen35_v2 as v2_attention
+    import xtuner.v1.module.attention.concept_qwen35 as v2_attention
 
     def sdpa(query, key, value, seq_ctx, scale):
         del seq_ctx

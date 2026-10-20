@@ -1,4 +1,5 @@
 """ConceptLM VQ/HLM objectives and globally calibrated loss contexts."""
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -11,14 +12,20 @@ from xtuner.v1.module.concept_sequence import next_concept_mse
 from .base_loss_ctx import BaseLossConfig, BaseLossContext, BaseLossKwargs
 
 
-def auxiliary_numerators(concept, predicted, codebooks, mask, boundaries, *,
-                         chunk_size=4, commitment_cost=0.25, norm_eps=1e-6):
+def auxiliary_numerators(
+    concept, predicted, codebooks, mask, boundaries, *, chunk_size=4, commitment_cost=0.25, norm_eps=1e-6
+):
     """Compose existing quantization and document-aware HLM primitives."""
-    norm = lambda value: F.rms_norm(value, (value.shape[-1],), eps=norm_eps)
+
+    def norm(value: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(value, (value.shape[-1],), eps=norm_eps)
+
     vq_input = norm(concept.detach())
     valid = mask.bool().reshape(mask.shape[0], -1, chunk_size).any(-1)
     quantized = quantize_concepts(
-        vq_input.transpose(0, 1), torch.stack(tuple(codebooks)), valid.transpose(0, 1),
+        vq_input.transpose(0, 1),
+        torch.stack(tuple(codebooks)),
+        valid.transpose(0, 1),
         commitment_cost=commitment_cost,
     )
     concept_lengths = [(end - start) // chunk_size for start, end in zip(boundaries, boundaries[1:])]
@@ -95,17 +102,27 @@ class ConceptLMLossContext(BaseLossContext):
         if kwargs.global_num_tokens is None:
             raise RuntimeError("ConceptLM contexts must be calibrated with build_batches")
         vq, hlm = auxiliary_numerators(
-            concept, predicted, codebooks, kwargs.loss_mask, kwargs.boundaries.tolist(),
-            chunk_size=config.concept_chunk_size, commitment_cost=config.commitment_cost,
-            norm_eps=config.norm_eps)
+            concept,
+            predicted,
+            codebooks,
+            kwargs.loss_mask,
+            kwargs.boundaries.tolist(),
+            chunk_size=config.concept_chunk_size,
+            commitment_cost=config.commitment_cost,
+            norm_eps=config.norm_eps,
+        )
         loss = config.concept_chunk_size * (config.vq_weight * vq + config.hlm_weight * hlm)
         loss = loss / kwargs.global_num_tokens
         # Same differentiable WORLD SUM convention as xTuner's CE context.
         if dist.is_initialized():
             loss = all_reduce(loss, group=dist.group.WORLD)
         return loss, {
-            "concept_vq_numerator": vq.detach(), "concept_hlm_numerator": hlm.detach(),
+            "concept_vq_numerator": vq.detach(),
+            "concept_hlm_numerator": hlm.detach(),
             "concept_vq_loss": config.concept_chunk_size * config.vq_weight * vq.detach() / kwargs.global_num_tokens,
-            "concept_hlm_loss": config.concept_chunk_size * config.hlm_weight * hlm.detach() / kwargs.global_num_tokens,
+            "concept_hlm_loss": config.concept_chunk_size
+            * config.hlm_weight
+            * hlm.detach()
+            / kwargs.global_num_tokens,
             "concept_valid_targets": kwargs.loss_mask.sum().detach(),
         }

@@ -4,7 +4,7 @@
 Run from the repository root with eight GPUs::
 
     PYTHONPATH=. torchrun --standalone --nproc-per-node=8 \
-        examples/v1/scripts/align_conceptlm_qwen35_v2_sp_training.py \
+        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_sp_training.py \
         --steps 5 --lengths 128 --output logs/ulysses-sp-training.json
 
 Every mode reloads the same checkpoint and starts a fresh AdamW optimizer.
@@ -194,7 +194,7 @@ def _load_engine(args: argparse.Namespace) -> Any:
     from xtuner.v1.config import AdamWConfig, FSDPConfig
     from xtuner.v1.engine.train_engine import TrainEngine
     from xtuner.v1.loss import CELossConfig
-    from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2Config
+    from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2Config
 
     _seed_step(args.seed)
     engine = TrainEngine(

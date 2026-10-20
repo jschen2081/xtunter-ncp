@@ -141,7 +141,7 @@ class _Writer:
 def _check_alignment_script(rank, init_method, directory):
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
-        path = Path(__file__).resolve().parents[2] / "examples/v1/scripts/align_conceptlm_qwen35_v2_sp_training.py"
+        path = Path(__file__).resolve().parents[2] / "examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_sp_training.py"
         spec = importlib.util.spec_from_file_location("sp_alignment", path)
         script = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(script)

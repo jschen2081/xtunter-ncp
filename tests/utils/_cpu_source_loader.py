@@ -36,7 +36,7 @@ def load_ast(relative, namespace, skip_imports=()):
 def load_libraries():
     load_file("xtuner.v1.utils.dtensor", "xtuner/v1/utils/dtensor.py")
     native = load_file("xtuner.v1.optim.muon", "xtuner/v1/optim/muon.py")
-    megatron = load_file("xtuner.v1.optim.megatron_muon", "xtuner/v1/optim/megatron_muon.py")
+    megatron = load_file("xtuner.v1.optim.concept_qwen35_muon", "xtuner/v1/optim/concept_qwen35_muon.py")
     try:
         from cyclopts import Parameter
     except ImportError:
@@ -48,7 +48,7 @@ def load_libraries():
     base.update(quantize_concepts=quantizer.quantize_concepts, next_concept_mse=sequence["next_concept_mse"])
     loss = load_ast("xtuner/v1/loss/conceptlm_loss.py", base,
                     ("base_loss_ctx", "xtuner.v1.module.concept_quantizer", "xtuner.v1.module.concept_sequence"))
-    tree = ast.parse((ROOT / "xtuner/v1/model/dense/conceptlm_qwen35_v2.py").read_text())
+    tree = ast.parse((ROOT / "xtuner/v1/model/dense/conceptlm_qwen35_9b.py").read_text())
     model_class = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                        and node.name == "ConceptLMQwen35V2")
     metadata = next(node for node in model_class.body if isinstance(node, ast.FunctionDef)

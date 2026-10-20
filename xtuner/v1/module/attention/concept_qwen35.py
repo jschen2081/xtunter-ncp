@@ -1,7 +1,7 @@
 """NCP Qwen3.5 v2 attention modules.
 
-These modules implement the repository attention contract while preserving the
-parameter layout and numerical order of the pinned HF checkpoint.
+These modules implement the repository attention contract while preserving the parameter layout and numerical order of
+the pinned HF checkpoint.
 """
 
 import math
@@ -22,7 +22,7 @@ from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.ops.gated_deltanet.gen_seq_idx import gen_seq_idx
 
 from ..linear import build_linear
-from ..rms_norm.ncp_qwen35_v2 import ZeroCenteredRMSNorm, env_on
+from ..rms_norm.concept_qwen35 import ZeroCenteredRMSNorm, env_on
 from .attn_outputs import AttnOutputs
 
 
@@ -150,7 +150,7 @@ def _fused_zero_rms_norm_gate(
     zero_centered_weight: Tensor,
     eps: float,
 ) -> Tensor:
-    from xtuner.v1.ops.gated_deltanet.ncp_qwen35_v2 import zero_rms_norm_gate
+    from xtuner.v1.ops.gated_deltanet.concept_qwen35 import zero_rms_norm_gate
 
     if isinstance(zero_centered_weight, DTensor):
         zero_centered_weight = zero_centered_weight.to_local()
@@ -307,9 +307,7 @@ class NCPQwen35V2MLA(nn.Module):
         sp_mesh = seq_ctx.sequence_parallel_mesh
         if sp_mesh is not None and sp_mesh.size() > 1:
             if self.num_heads % sp_mesh.size():
-                raise ValueError(
-                    f"MLA heads ({self.num_heads}) must be divisible by SP size ({sp_mesh.size()})"
-                )
+                raise ValueError(f"MLA heads ({self.num_heads}) must be divisible by SP size ({sp_mesh.size()})")
             query = _mla_query_all_to_all(query, seq_ctx)
             key = _mla_key_all_to_all(key, seq_ctx)
             value = _mla_value_all_to_all(value, seq_ctx)
@@ -445,9 +443,7 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
             query = _gdn_query_all_to_all(query.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
             key = _gdn_key_all_to_all(key.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
             value = _gdn_value_all_to_all(value.transpose(1, 2), seq_ctx).transpose(1, 2).contiguous()
-            query_weight, key_weight, value_weight = weight.split(
-                (self.key_dim, self.key_dim, self.value_dim), dim=0
-            )
+            query_weight, key_weight, value_weight = weight.split((self.key_dim, self.key_dim, self.value_dim), dim=0)
             rank = seq_ctx.sp_rank
             weight = torch.cat(
                 (
@@ -462,9 +458,7 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         if qkv.is_cuda:
             from xtuner.v1.ops.gated_deltanet import get_causal_conv1d_fn
 
-            qkv = get_causal_conv1d_fn()(
-                x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx
-            )
+            qkv = get_causal_conv1d_fn()(x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx)
         else:
             qkv = _cpu_conv_documents(qkv, weight.to(qkv.dtype), seq_ctx.cu_seq_lens_q)
         sp_size = sp_mesh.size() if sp_mesh is not None else 1
@@ -477,9 +471,7 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         value = value.reshape(*qkv.shape[:2], local_v_heads, self.head_v_dim)
         use_kernel_qk_l2 = qkv.is_cuda and self.use_fused_qk_l2
         if not use_kernel_qk_l2:
-            query_key = query_key.float() * torch.rsqrt(
-                query_key.float().square().sum(-1, keepdim=True) + 1.0e-6
-            )
+            query_key = query_key.float() * torch.rsqrt(query_key.float().square().sum(-1, keepdim=True) + 1.0e-6)
             query_key = query_key.to(qkv.dtype)
         query, key = query_key.split(local_k_heads, dim=2)
         repeats = self.num_v_heads // self.num_k_heads

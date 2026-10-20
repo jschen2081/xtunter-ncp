@@ -13,7 +13,7 @@ import torch
 
 @pytest.fixture
 def training_script(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    script = Path(__file__).resolve().parents[2] / "examples/v1/scripts/align_conceptlm_qwen35_v2_hf_training.py"
+    script = Path(__file__).resolve().parents[2] / "examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf_training.py"
     monkeypatch.setattr(os, "environ", os.environ.copy())
     return runpy.run_path(str(script))
 

@@ -33,6 +33,7 @@ class AttentionConfigProtocol(Protocol):
 
     def build(
         self,
+        *,
         hidden_size: int,
         layer_type: Literal["full_attention", "sliding_attention"] | None = None,
         layer_idx: int = 0,

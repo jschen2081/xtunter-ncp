@@ -320,8 +320,15 @@ class MuonConfig(OptimConfig):
 
         # Sanity check: ensure all trainable parameters are assigned to optimizer
         for decay, parameters in explicit_adamw_params.items():
-            param_groups.append(dict(params=parameters, algorithm="adamw", clip_grad=True,
-                                     adamw_foreach=self.adamw_foreach, weight_decay=decay))
+            param_groups.append(
+                dict(
+                    params=parameters,
+                    algorithm="adamw",
+                    clip_grad=True,
+                    adamw_foreach=self.adamw_foreach,
+                    weight_decay=decay,
+                )
+            )
         total_assigned = (
             len(muon_params_regular)
             + len(muon_params_moe_fused_w1w3)

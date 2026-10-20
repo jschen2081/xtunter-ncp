@@ -2,6 +2,7 @@
 
 Uses fresh optimizer state; cross-topology checkpoint migration is unsupported.
 """
+
 import math
 
 import torch
@@ -41,7 +42,8 @@ def production_momentum(G, M, momentum, nesterov):
 
 
 def production_newton_schulz(value, epsilon=1e-7, num_experts=1):
-    """Production-specific fused BF16 polynomial, isolated from the legacy kernel."""
+    """Production-specific fused BF16 polynomial, isolated from the legacy
+    kernel."""
     shape = value.shape
     matrices = value.float().reshape(num_experts, -1, value.shape[-1])
     results = []
@@ -52,9 +54,13 @@ def production_newton_schulz(value, epsilon=1e-7, num_experts=1):
         if transpose:
             matrix = matrix.mT
         matrix = F.normalize(matrix, p=2, dim=(-2, -1), eps=1e-7).to(torch.bfloat16)
-        for a, b, c in ((4.0848, -6.8946, 2.9270), (3.9505, -6.3029, 2.6377),
-                        (3.7418, -5.5913, 2.3037), (2.8769, -3.1427, 1.2046),
-                        (2.8366, -3.0525, 1.2012)):
+        for a, b, c in (
+            (4.0848, -6.8946, 2.9270),
+            (3.9505, -6.3029, 2.6377),
+            (3.7418, -5.5913, 2.3037),
+            (2.8769, -3.1427, 1.2046),
+            (2.8366, -3.0525, 1.2012),
+        ):
             gram = matrix @ matrix.mT
             polynomial = torch.addmm(gram, gram, gram, alpha=c, beta=b)
             matrix = torch.addmm(matrix, polynomial, matrix, alpha=1.0, beta=a)
@@ -67,18 +73,31 @@ def adam_gate_update(target, grad, state, group):
     # Reuse PyTorch AdamW rather than modifying the shared xTuner AdamW kernel.
     # The fused Muon parameter already received its weight decay once.
     adamw(
-        [target], [grad], [state["production_gate_m"]], [state["production_gate_v"]], [],
+        [target],
+        [grad],
+        [state["production_gate_m"]],
+        [state["production_gate_v"]],
+        [],
         [torch.tensor(float(state["production_gate_step"] - 1))],
-        amsgrad=False, beta1=group["beta1"], beta2=group["beta2"], lr=group["lr"],
-        weight_decay=0.0, eps=group["epsilon"], maximize=False, foreach=False, fused=False,
+        amsgrad=False,
+        beta1=group["beta1"],
+        beta2=group["beta2"],
+        lr=group["lr"],
+        weight_decay=0.0,
+        eps=group["epsilon"],
+        maximize=False,
+        foreach=False,
+        fused=False,
     )
+
 
 class MegatronMuon(Muon):
     """EMA Muon with semantic projection splits and AdamW control rows."""
 
     def __init__(self, params, *, muon_adamw_ranges=None, **kwargs):
-        super().__init__(params, pre_orthogonalize_fn=production_momentum,
-                         newton_schulz_func=production_newton_schulz, **kwargs)
+        super().__init__(
+            params, pre_orthogonalize_fn=production_momentum, newton_schulz_func=production_newton_schulz, **kwargs
+        )
         self._muon_adamw_ranges = muon_adamw_ranges or {}
         for param, (start, end) in self._muon_adamw_ranges.items():
             if param not in self._muon_split_sizes or start != sum(self._muon_split_sizes[param]):

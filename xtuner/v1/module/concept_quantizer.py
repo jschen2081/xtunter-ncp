@@ -111,7 +111,9 @@ class ConceptQuantizer(nn.Module):
 
     def forward(self, concept_hidden: Tensor, concept_mask: Tensor | None = None) -> QuantizedConcepts:
         return quantize_concepts(
-            concept_hidden, self.transformed_codebook(), concept_mask,
+            concept_hidden,
+            self.transformed_codebook(),
+            concept_mask,
             commitment_cost=self.commitment_cost,
         )
 
@@ -123,19 +125,18 @@ def quantize_concepts(
     *,
     commitment_cost: float = 0.25,
 ) -> QuantizedConcepts:
-    """Quantize sequence-major concepts using an existing differentiable codebook.
+    """Quantize sequence-major concepts using an existing differentiable
+    codebook.
 
-    Shared by ConceptQuantizer.forward and models that already own codebook
-    parameters. This function neither creates nor registers new parameters.
+    Shared by ConceptQuantizer.forward and models that already own codebook parameters. This function neither creates
+    nor registers new parameters.
     """
     if codebook.ndim != 3 or any(size <= 0 for size in codebook.shape):
         raise ValueError("codebook must have shape [num_codebooks, codebook_size, head_dim]")
     num_codebooks, codebook_size, head_dim = codebook.shape
     hidden_size = num_codebooks * head_dim
     if concept_hidden.dim() != 3 or concept_hidden.shape[-1] != hidden_size:
-        raise ValueError(
-            f"concept_hidden must have shape [S, B, {hidden_size}], got {tuple(concept_hidden.shape)}"
-        )
+        raise ValueError(f"concept_hidden must have shape [S, B, {hidden_size}], got {tuple(concept_hidden.shape)}")
     concept_seq, batch_size, _ = concept_hidden.shape
     inputs = concept_hidden.reshape(concept_seq, batch_size, num_codebooks, head_dim)
     distances = (
@@ -145,9 +146,7 @@ def quantize_concepts(
     )
     code_ids = torch.argmin(distances, dim=-1)
     heads = [
-        codebook[idx]
-        .index_select(0, code_ids[..., idx].reshape(-1))
-        .reshape(concept_seq, batch_size, head_dim)
+        codebook[idx].index_select(0, code_ids[..., idx].reshape(-1)).reshape(concept_seq, batch_size, head_dim)
         for idx in range(num_codebooks)
     ]
     quantized = torch.stack(heads, dim=2).reshape_as(concept_hidden).to(concept_hidden.dtype)

@@ -13,14 +13,14 @@ on rank 0's single GPU.
 Launch from the xtuner-ncp repo::
 
     torchrun --standalone --nproc-per-node=8 \\
-        examples/v1/scripts/align_conceptlm_qwen35_v2_hf.py
+        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf.py
 
     torchrun --standalone --nproc-per-node=8 \\
-        examples/v1/scripts/align_conceptlm_qwen35_v2_hf.py \\
+        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf.py \\
         --kernel-path production
 
     torchrun --standalone --nproc-per-node=8 \\
-        examples/v1/scripts/align_conceptlm_qwen35_v2_hf.py \\
+        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf.py \\
         --kernel-path production --lengths 8 128 --backward-length 8
 """
 
@@ -73,7 +73,7 @@ os.environ.update(
         "NCP_Q35V2_SHARE_CROSS_INV_RMS": "1",
     }
 )
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -239,7 +239,7 @@ def use_hf_mla_kernel() -> str:
     """Point XTuner MLA at the same SDPA call HF uses here."""
     import torch.nn.functional as F
 
-    import xtuner.v1.module.attention.ncp_qwen35_v2 as v2_attention
+    import xtuner.v1.module.attention.concept_qwen35 as v2_attention
 
     def sdpa(query, key, value, seq_ctx, scale):
         del seq_ctx
@@ -483,7 +483,7 @@ def load_xtuner(hf_path: Path, rank: int, compile_model: bool):
     import torch
 
     from xtuner.v1.config import FSDPConfig
-    from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2Config
+    from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2Config
 
     with torch.device("meta"):
         model = ConceptLMQwen35V2Config(compile_cfg=compile_model).build()

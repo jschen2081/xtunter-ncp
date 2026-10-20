@@ -17,7 +17,7 @@ initial checkpoint loading. This avoids materializing full-model CPU snapshots.
 Launch from the repository root::
 
     torchrun --standalone --nproc-per-node=8 \
-        examples/v1/scripts/align_conceptlm_qwen35_v2_hf_training.py \
+        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf_training.py \
         --hf-path "$NCP_QWEN35_V2_PATH" --steps 3 --length 8
 """
 
@@ -254,7 +254,7 @@ def _load_xtuner_training_model(
     import torch
 
     from xtuner.v1.config import FSDPConfig
-    from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2Config
+    from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2Config
 
     with torch.device("meta"):
         model = ConceptLMQwen35V2Config(compile_cfg=compile_model).build()

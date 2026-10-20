@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
-from xtuner.v1.model.dense.conceptlm_qwen35_v2 import (
+from xtuner.v1.model.dense.conceptlm_qwen35_9b import (
     CONCEPTLM_QWEN35_V2_COMPILE_CFG,
     ConceptLMQwen35V2,
     ConceptLMQwen35V2Config,
@@ -25,7 +25,7 @@ from xtuner.v1.module.attention import (
     NCPQwen35V2GatedDeltaNet,
     NCPQwen35V2MLA,
 )
-from xtuner.v1.module.attention.ncp_qwen35_v2 import (
+from xtuner.v1.module.attention.concept_qwen35 import (
     NCPQwen35V2GatedDeltaNetConfig,
     NCPQwen35V2MLAConfig,
     _cpu_conv_documents,
@@ -236,7 +236,7 @@ class TestConceptLMQwen35V2DenseLayer:
         config: _TinyV2Config,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import xtuner.v1.module.attention.ncp_qwen35_v2 as v2_attention
+        import xtuner.v1.module.attention.concept_qwen35 as v2_attention
 
         float8_cfg = Float8Config()
         received: list[Float8Config | None] = []
@@ -643,7 +643,7 @@ class TestMLAFlashAttention:
     def test_matches_sdpa_output_and_gradients(
         self, lengths: list[int], qk_width: int, value_width: int
     ) -> None:
-        from xtuner.v1.module.attention.ncp_qwen35_v2 import _causal_attention
+        from xtuner.v1.module.attention.concept_qwen35 import _causal_attention
 
         torch.manual_seed(1)
         total = sum(lengths)
@@ -674,8 +674,8 @@ class TestMLAFlashAttention:
 class TestGDNZeroCenteredNormGate:
     @pytest.mark.parametrize("rows", [8, 65])
     def test_preserves_te_weight_and_bf16_rounding(self, rows: int) -> None:
-        from xtuner.v1.module.attention.ncp_qwen35_v2 import _fused_zero_rms_norm_gate
-        from xtuner.v1.ops.rms_norm.ncp_qwen35_v2 import zero_rmsnorm_cuda
+        from xtuner.v1.module.attention.concept_qwen35 import _fused_zero_rms_norm_gate
+        from xtuner.v1.ops.rms_norm.concept_qwen35 import zero_rmsnorm_cuda
 
         torch.manual_seed(42)
         x = torch.randn(1, rows, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)

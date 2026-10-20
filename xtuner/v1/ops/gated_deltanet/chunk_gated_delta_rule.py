@@ -19,7 +19,8 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
 def _uses_state_v_first(function) -> bool:
-    """Detect the FLA 0.5.x state-layout spelling without relying on package metadata."""
+    """Detect the FLA 0.5.x state-layout spelling without relying on package
+    metadata."""
     parameters = inspect.signature(function).parameters
     if "state_v_first" in parameters:
         return True

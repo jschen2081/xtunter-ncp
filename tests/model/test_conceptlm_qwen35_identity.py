@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.model.dense.conceptlm_qwen35 import ConceptLMQwen35Config
+from xtuner.v1.model.dense.conceptlm_qwen35_2b import ConceptLMQwen35Config
 from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig
 
 

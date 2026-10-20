@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, LRScheduler, SequentialLR
 
+
 if TYPE_CHECKING:
     from xtuner.v1.config import LRConfig
-
 
 
 class WarmupDecayLR(LRScheduler):
@@ -24,8 +24,13 @@ class WarmupDecayLR(LRScheduler):
     """
 
     def __init__(
-        self, optimizer: Optimizer, style: str, minimum: float,
-        warmup: int, decay: int, tail: int | None,
+        self,
+        optimizer: Optimizer,
+        style: str,
+        minimum: float,
+        warmup: int,
+        decay: int,
+        tail: int | None,
     ) -> None:
         self.style = style
         self.minimum = minimum
@@ -58,7 +63,8 @@ class WarmupDecayLR(LRScheduler):
 
 
 def build_lr_scheduler(optimizer: Optimizer, config: "LRConfig", total_steps: int) -> LRScheduler:
-    """Build a scheduler whose initial LR is used by the first optimizer update.
+    """Build a scheduler whose initial LR is used by the first optimizer
+    update.
 
     Explicit step counts use completed optimizer updates, rather than microsteps.
     With fixed GBS this is equivalent to Megatron's sample-count schedule. The
@@ -83,9 +89,12 @@ def build_lr_scheduler(optimizer: Optimizer, config: "LRConfig", total_steps: in
     if not explicit:
         # Preserve existing recipes, including SequentialLR checkpoint format.
         warmup_scheduler = LambdaLR(optimizer, lambda step: step / warmup if step < warmup else 1)
+        scheduler: LRScheduler
         if config.lr_type == "linear":
             scheduler = LinearLR(
-                optimizer, start_factor=1.0, end_factor=config.lr_min / optimizer.defaults["lr"],
+                optimizer,
+                start_factor=1.0,
+                end_factor=config.lr_min / optimizer.defaults["lr"],
                 total_iters=decay - warmup,
             )
         elif config.lr_type == "cosine":

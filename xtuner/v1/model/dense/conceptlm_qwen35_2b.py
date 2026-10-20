@@ -275,7 +275,9 @@ class ConceptLMQwen35(BaseModel):
         # HLM: predict the next concept of the same document.
         hlm_target = vq_target.detach() if config.concept_detach_hlm_target else vq_target
         hlm_numerator, hlm_count = next_concept_mse(
-            self.concept_vq_pred_norm(predicted), hlm_target, concept_lengths,
+            self.concept_vq_pred_norm(predicted),
+            hlm_target,
+            concept_lengths,
         )
 
         expanded = expand_concepts(predicted, doc_lengths, concept_lengths, chunk_size, config.concept_shift_feature)

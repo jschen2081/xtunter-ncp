@@ -52,7 +52,7 @@ def build_trainer_config(config: dict[str, Any]) -> "TrainerConfig":
     from xtuner.v1.datasets import PretrainTokenizeFunctionConfig
     from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
     from xtuner.v1.loss import CELossConfig, ConceptLMLossConfig
-    from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2Config
+    from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2Config
     from xtuner.v1.train import TrainerConfig
     from xtuner.v1.train.trainer import HooksConfig
 

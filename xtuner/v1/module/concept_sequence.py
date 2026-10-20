@@ -120,8 +120,8 @@ def next_concept_mse(
 ) -> tuple[Tensor, Tensor]:
     """Sum next-concept MSE within documents and count valid successors.
 
-    Callers own normalization and target detachment. An optional batch-major
-    concept mask excludes invalid target concepts without crossing documents.
+    Callers own normalization and target detachment. An optional batch-major concept mask excludes invalid target
+    concepts without crossing documents.
     """
     if predicted.shape != target.shape or predicted.ndim != 3:
         raise ValueError("HLM predictions and targets must have matching [B, S, H] shapes")

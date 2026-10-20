@@ -608,7 +608,8 @@ class BaseModel(nn.Module):
 
     @torch.no_grad()
     def scale_and_reduce_grad(self) -> None:
-        """Average gradients of replicated parameters explicitly excluded from FSDP."""
+        """Average gradients of replicated parameters explicitly excluded from
+        FSDP."""
         ignored_names: set[str] = getattr(self, "_fsdp_ignored_param_names", set())
         grads_by_group: dict[dist.ProcessGroup, list[torch.Tensor]] = {}
         for name, param in self.named_parameters():

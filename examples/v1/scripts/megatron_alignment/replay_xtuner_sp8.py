@@ -34,7 +34,7 @@ def main():
     if result_path.exists():
         raise FileExistsError(f"Use a fresh capture directory: {result_path}")
     sys.path.insert(0, str(args.xtuner_root))
-    sys.path.insert(0, str(args.xtuner_root / "examples/v1/scripts"))
+    sys.path.insert(0, str(args.xtuner_root / "examples/v1/scripts/megatron_alignment"))
     from align_conceptlm_qwen35_v2_sp_training import _configure_kernels, _seed_step
 
     _configure_kernels()
@@ -46,7 +46,7 @@ def main():
     from xtuner.v1.engine.train_engine import TrainEngine
     from xtuner.v1.loss import CELossConfig, ConceptLMLossConfig
     from xtuner.v1.model.base import ModelItem
-    from xtuner.v1.model.dense.conceptlm_qwen35_v2 import ConceptLMQwen35V2, ConceptLMQwen35V2Config
+    from xtuner.v1.model.dense.conceptlm_qwen35_9b import ConceptLMQwen35V2, ConceptLMQwen35V2Config
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
