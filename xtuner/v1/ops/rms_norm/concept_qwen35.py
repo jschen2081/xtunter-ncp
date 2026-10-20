@@ -1,4 +1,4 @@
-"""Pinned zero-centered RMSNorm kernel for NCP Qwen3.5 v2."""
+"""Forward-only TE-equivalent RMSNorm reference for numerical tests."""
 
 import torch
 
@@ -65,6 +65,8 @@ if triton is not None:
 def zero_rmsnorm_cuda(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Match the validated Transformer Engine 2.14.1 reduction for supported
     BF16 widths."""
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        raise RuntimeError("TE-equivalent RMSNorm is a forward-only numerical reference")
     if triton is None:
         raise RuntimeError("CUDA RMSNorm requires the pinned Triton runtime")
     width = x.shape[-1]

@@ -22,11 +22,7 @@ def eager_zero_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 
 def zero_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    """HF ``ZeroCenteredRMSNorm`` with the validated optional kernels."""
-    if x.is_cuda and env_on("NCP_Q35V2_TE_RMS"):
-        from xtuner.v1.ops.rms_norm.concept_qwen35 import zero_rmsnorm_cuda
-
-        return zero_rmsnorm_cuda(x, weight, eps)
+    """Differentiable zero-centered normalization used by the model."""
     if env_on("NCP_Q35V2_TORCH_RMS"):
         return F.rms_norm(x, (weight.numel(),), effective_weight(weight), eps)
     return eager_zero_rms_norm(x, weight, eps)

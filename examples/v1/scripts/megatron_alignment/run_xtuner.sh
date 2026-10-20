@@ -30,13 +30,15 @@ else
 fi
 echo "CONFIG: FA3=$USE_FA3 ZeRO=$ZERO_STAGE no_sync=$GRADIENT_ACCUMULATION_NO_SYNC compile=$ENABLE_COMPILE recompute_ratio=$RECOMPUTE_RATIO trace=$ENABLE_TRACE"
 # Kernel selection must precede package imports in the standard CLI.
-export XTUNER_DETERMINISTIC=true XTUNER_GDN_CUSTOM_OP=true XTUNER_GDN_FUSED_QK_L2=true
-export XTUNER_GDN_FUSED_NORM_GATE=true NCP_Q35V2_TORCH_RMS=1 NCP_Q35V2_MUDD_RMS=1
-export NCP_Q35V2_TE_RMS=0 NCP_Q35V2_GDN_TORCH_INPUT_NORM=1 NCP_Q35V2_TRITON_DUAL_CROSS_MUDD=0
-unset XTUNER_HF_IMPL
+
 PY="${XTUNER_PYTHON:-python}"
 REPO="$(cd "$ALIGN_DIR/../../../.." && pwd)"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+kernel_exports="$("$PY" "$ALIGN_DIR/kernel_config.py")"
+while IFS='=' read -r kernel_name kernel_value; do
+  export "$kernel_name=$kernel_value"
+done <<< "$kernel_exports"
+unset XTUNER_HF_IMPL
 "$PY" "$ALIGN_DIR/runtime_requirements.py"
 # Select the output directory for the shared native Trainer entry.
 sp_size=1

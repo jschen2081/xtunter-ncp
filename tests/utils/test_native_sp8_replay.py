@@ -184,7 +184,7 @@ class TestNativeSP8Replay:
     ) -> None:
         metadata = make_capture(tmp_path, length=32)
         namespace = adapter_namespace()
-        namespace["build_trainer_config"] = lambda config: SimpleNamespace(native_trainer=True, sp_size=8)
+        namespace["build_trainer_config"] = lambda config, *, dataloader_cfg: SimpleNamespace(native_trainer=True, sp_size=8, dataloader_cfg=dataloader_cfg)
         namespace["flash_attn_varlen_func"] = SimpleNamespace(__name__="gpu_flash_varlen_attn_v3")
         config = namespace["build_replay_config"](
             {
@@ -227,21 +227,29 @@ class TestNativeSP8Replay:
         recorder = tmp_path / "python-recorder"
         log = tmp_path / "calls.jsonl"
         recorder.write_text(
-            f"#!{sys.executable}\nimport json, os, sys\n"
+            f"#!{sys.executable}\nimport json, os, runpy, sys\n"
             "with open(os.environ['CALL_LOG'], 'a') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1].endswith('/kernel_config.py'):\n"
+            "    runpy.run_path(sys.argv[1], run_name='__main__')\n"
+            "else:\n"
+            "    assert os.environ['XTUNER_GDN_CUSTOM_OP'] == 'true'\n"
+            "    assert os.environ['NCP_Q35V2_TRITON_DUAL_CROSS_MUDD'] == '0'\n"
+            "    assert 'XTUNER_HF_IMPL' not in os.environ\n"
         )
         recorder.chmod(0o755)
         subprocess.run(
             ["bash", str(SCRIPTS / "run_xtuner.sh"), *arguments],
             check=True,
-            env=dict(os.environ, XTUNER_PYTHON=str(recorder), CALL_LOG=str(log), ALIGNMENT_RUN_DIR=str(tmp_path)),
+            env=dict(os.environ, XTUNER_PYTHON=str(recorder), CALL_LOG=str(log), ALIGNMENT_RUN_DIR=str(tmp_path),
+                     XTUNER_HF_IMPL="true", NCP_Q35V2_TRITON_DUAL_CROSS_MUDD="1"),
         )
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         sp_size = 8 if arguments else 1
-        assert len(calls) == 4
-        assert calls[1][0] == str(SCRIPTS / "replay_xtuner.py")
-        assert calls[2][:2] == ["-m", "torch.distributed.run"]
-        assert "xtuner.v1.train.cli.sft" in calls[2]
-        assert calls[2][-1] == str(tmp_path / f"xtuner_sp{sp_size}_native/trainer_config.py")
-        assert calls[3][-3:] == ["--sp-size", str(sp_size), "--collect-metrics"]
+        assert len(calls) == 5
+        assert calls[0] == [str(SCRIPTS / "kernel_config.py")]
+        assert calls[2][0] == str(SCRIPTS / "replay_xtuner.py")
+        assert calls[3][:2] == ["-m", "torch.distributed.run"]
+        assert "xtuner.v1.train.cli.sft" in calls[3]
+        assert calls[3][-1] == str(tmp_path / f"xtuner_sp{sp_size}_native/trainer_config.py")
+        assert calls[4][-3:] == ["--sp-size", str(sp_size), "--collect-metrics"]

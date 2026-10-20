@@ -19,9 +19,11 @@ PY="${XTUNER_PYTHON:-/usr/bin/python}"
 [[ ! -e "$OUT" ]] || { echo "Refusing to overwrite $OUT" >&2; exit 2; }
 export PYTHONPATH="$BASE/xtuner_text_runtime_deps:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export XTUNER_USE_FA3="$USE_FA3" OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
-export XTUNER_DETERMINISTIC=true XTUNER_GDN_CUSTOM_OP=true XTUNER_GDN_FUSED_QK_L2=true
-export XTUNER_GDN_FUSED_NORM_GATE=true NCP_Q35V2_TORCH_RMS=1 NCP_Q35V2_MUDD_RMS=1
-export NCP_Q35V2_TE_RMS=0 NCP_Q35V2_GDN_TORCH_INPUT_NORM=1 NCP_Q35V2_TRITON_DUAL_CROSS_MUDD=0
+
+kernel_exports="$("$PY" "$REPO/examples/v1/scripts/megatron_alignment/kernel_config.py")"
+while IFS='=' read -r kernel_name kernel_value; do
+  export "$kernel_name=$kernel_value"
+done <<< "$kernel_exports"
 unset XTUNER_HF_IMPL
 "$PY" "$REPO/examples/v1/scripts/megatron_alignment/runtime_requirements.py"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/$(basename "$OUT")/triton}"

@@ -172,19 +172,9 @@ def main() -> None:
 
 
 def _configure_kernels() -> None:
-    os.environ["XTUNER_DETERMINISTIC"] = "true"
-    os.environ.pop("XTUNER_HF_IMPL", None)
-    for name, value in {
-        "XTUNER_GDN_CUSTOM_OP": "true",
-        "XTUNER_GDN_FUSED_QK_L2": "true",
-        "XTUNER_GDN_FUSED_NORM_GATE": "true",
-        "NCP_Q35V2_TORCH_RMS": "1",
-        "NCP_Q35V2_MUDD_RMS": "1",
-        "NCP_Q35V2_TE_RMS": "0",
-        "NCP_Q35V2_GDN_TORCH_INPUT_NORM": "1",
-        "NCP_Q35V2_TRITON_DUAL_CROSS_MUDD": "0",
-    }.items():
-        os.environ[name] = value
+    from examples.v1.scripts.megatron_alignment.kernel_config import configure_training_kernels
+
+    configure_training_kernels()
 
 
 def _load_engine(args: argparse.Namespace) -> Any:

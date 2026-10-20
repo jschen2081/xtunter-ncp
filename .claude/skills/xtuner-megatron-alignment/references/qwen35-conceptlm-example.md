@@ -109,6 +109,7 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 | 文件 | 职责 |
 |---|---|
 | replay_xtuner.py / run_xtuner.sh | 生产输入回放，SP1/SP8统一标准CLI → Trainer.fit；LR由xTuner scheduler独立计算 |
+| kernel_config.py | 独立训练、回放与SP验证共享的kernel策略，必须先于FLA/xTuner导入生效 |
 | batch_contract.py | 元数据、dtype/shape/内容指纹和mask/边界检查 |
 | compare_results.py | completion、step/micro、targets、指纹、LR和误差报告 |
 | train_qwen35.py / replay_trainer_config.py / recorded_batch_source.py | 原生Trainer配置与捕获数据适配；SP组内按(micro,原rank)顺序读取相同完整输入，交由Trainer切分 |
@@ -119,6 +120,8 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 
 - xtuner/v1/loss/conceptlm_loss.py：VQ/HLM context、token校准、SP full-feature路径。
 - xtuner/v1/model/dense/conceptlm_qwen35_9b.py：模型、loss接入、Muon语义布局、SP gather。
+- xtuner/v1/ops/mudd/concept_qwen35.py：dual Cross-MUDD仅用于显式推理实验，需eval()与no_grad()/inference_mode()，训练禁止开启。
+- xtuner/v1/ops/rms_norm/concept_qwen35.py：仅前向数值参考，训练norm不调用该算子。
 - xtuner/v1/module/concept_quantizer.py / concept_sequence.py：共享量化和HLM序列能力。
 - xtuner/v1/config/optim.py、xtuner/v1/optim/concept_qwen35_muon.py / muon.py：opt-in适配、共享通信和原有默认实现。
 - examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_sp_training.py：原SP测试；随机数据、AdamW/CE默认配置不等于生产对比recipe。

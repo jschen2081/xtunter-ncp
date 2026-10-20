@@ -41,15 +41,6 @@ os.environ.update(
         "NCP_Q35V2_TORCH_RMS": "1",
         "NCP_Q35V2_MUDD_RMS": "1",
         "NCP_Q35V2_TE_RMS": "0",
-        # 手写 fp32。ZeroCentered 关 TORCH_RMS 和 TE_RMS；Mudd 另关 MUDD_RMS。
-        # "NCP_Q35V2_TORCH_RMS": "0",
-        # "NCP_Q35V2_MUDD_RMS": "0",
-        # "NCP_Q35V2_TE_RMS": "0",
-        # TE Triton，只作用于 ZeroCenteredRMSNorm，且优先于 TORCH_RMS。Mudd 仍走 F.rms_norm。
-        # Zero-centered norms and MUDD use differentiable F.rms_norm implementations.
-        # "NCP_Q35V2_TORCH_RMS": "0",
-        # "NCP_Q35V2_MUDD_RMS": "1",
-        # "NCP_Q35V2_TE_RMS": "1",
 
         # Exercise XTuner's generic Triton RMSNorm on the production path.
         "XTUNER_USE_NATIVE_RMSNORM": "0",
@@ -64,10 +55,8 @@ os.environ.update(
         "NCP_Q35V2_TE_FINAL_NORM": "0",
         "NCP_Q35V2_TRITON_CROSS_MUDD": "0",
 
-        # 1打开dual_cross_mudd的triton优化路径
         "NCP_Q35V2_TRITON_DUAL_CROSS_MUDD": "0",
         # The current dual Cross-MUDD Triton implementation is forward-only.
-        # "NCP_Q35V2_TRITON_DUAL_CROSS_MUDD": "1",
 
         "NCP_Q35V2_COMPILE_CROSS_ROUTER": "0",
         "NCP_Q35V2_SHARE_CROSS_INV_RMS": "1",

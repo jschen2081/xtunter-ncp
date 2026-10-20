@@ -188,7 +188,7 @@ class TestNativeSP1Replay:
         metadata = make_capture(tmp_path)
         namespace = adapter_namespace()
         monkeypatch.setenv("WORLD_SIZE", "8")
-        namespace["build_trainer_config"] = lambda config: SimpleNamespace(native_trainer=True)
+        namespace["build_trainer_config"] = lambda config, *, dataloader_cfg: SimpleNamespace(native_trainer=True, dataloader_cfg=dataloader_cfg)
         namespace["flash_attn_varlen_func"] = SimpleNamespace(__name__="gpu_flash_varlen_attn_v3")
         native_config = namespace["build_replay_config"]({
             "capture_dir": str(tmp_path), "run_dir": str(tmp_path), "capture_metadata": metadata,

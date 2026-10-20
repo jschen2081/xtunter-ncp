@@ -122,14 +122,13 @@ def build_replay_config(config: dict[str, Any]) -> TrainerConfig:
     Returns:
         TrainerConfig: Standard CLI configuration for captured DP/SP inputs.
     """
-    trainer = build_trainer_config(config)
     backend = flash_attn_varlen_func.__name__
     if os.environ.get("XTUNER_USE_FA3", "0") == "1" and backend != "gpu_flash_varlen_attn_v3":
         raise ValueError("FA3 requested but a different attention backend was selected")
     print(f"ATTENTION_BACKEND {backend}", flush=True)
     if int(os.environ.get("WORLD_SIZE", "8")) != 8 or config["sp_size"] not in (1, 8):
         raise ValueError("Native replay supports eight ranks with SP1 or SP8")
-    trainer.dataloader_cfg = RecordedBatchDataloaderConfig(
+    dataloader_cfg = RecordedBatchDataloaderConfig(
         capture_dir=Path(config["capture_dir"]),
         audit_dir=Path(config["run_dir"]),
         capture_metadata=config["capture_metadata"],
@@ -139,4 +138,4 @@ def build_replay_config(config: dict[str, Any]) -> TrainerConfig:
         pack_to_max_length=True,
         group_by_length=False,
     )
-    return trainer
+    return build_trainer_config(config, dataloader_cfg=dataloader_cfg)
