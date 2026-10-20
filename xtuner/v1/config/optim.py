@@ -385,8 +385,12 @@ class MuonConfig(OptimConfig):
 
 class LRConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    lr_type: Annotated[Literal["cosine", "linear", "constant"], Parameter(help="Type of learning rate schedule")] = (
-        "constant"
-    )
+    lr_type: Annotated[
+        Literal["cosine", "linear", "constant", "wsd"], Parameter(help="Type of learning rate schedule")
+    ] = "constant"
     warmup_ratio: Annotated[float, Parameter(help="Ratio of warmup steps to total training steps")] = 0.03
     lr_min: Annotated[float, Parameter(help="Minimum learning rate for optimization")] = 1e-6
+
+    warmup_steps: Annotated[int | None, Parameter(help="Explicit warmup updates; overrides warmup_ratio")] = None
+    decay_steps: Annotated[int | None, Parameter(help="Full LR schedule updates, independent of run length")] = None
+    wsd_decay_steps: Annotated[int | None, Parameter(help="Number of updates in the WSD decay tail")] = None

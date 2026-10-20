@@ -1,4 +1,4 @@
-"""ConceptLM VQ/HLM objectives and globally calibrated loss contexts (SP1)."""
+"""ConceptLM VQ/HLM objectives and globally calibrated loss contexts."""
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -69,6 +69,9 @@ class ConceptLMLossConfig(BaseLossConfig):
             raise ValueError("ConceptLM sequence lengths must align to concept chunks")
         if boundaries[0].item() != 0 or boundaries[-1].item() != mask.shape[1]:
             raise ValueError("ConceptLM boundaries must cover all tokens")
+        # Native Trainer keeps collated labels on CPU; the context owns its
+        # device-local mask, as the CE context does. Preserve full SP masks.
+        mask = mask.to(seq_ctx.input_ids.device)
         return ConceptLMLossContext(self, ConceptLMLossKwargs(loss_mask=mask, boundaries=boundaries))
 
 
@@ -100,4 +103,9 @@ class ConceptLMLossContext(BaseLossContext):
         # Same differentiable WORLD SUM convention as xTuner's CE context.
         if dist.is_initialized():
             loss = all_reduce(loss, group=dist.group.WORLD)
-        return loss, {"concept_vq_numerator": vq.detach(), "concept_hlm_numerator": hlm.detach()}
+        return loss, {
+            "concept_vq_numerator": vq.detach(), "concept_hlm_numerator": hlm.detach(),
+            "concept_vq_loss": config.concept_chunk_size * config.vq_weight * vq.detach() / kwargs.global_num_tokens,
+            "concept_hlm_loss": config.concept_chunk_size * config.hlm_weight * hlm.detach() / kwargs.global_num_tokens,
+            "concept_valid_targets": kwargs.loss_mask.sum().detach(),
+        }
