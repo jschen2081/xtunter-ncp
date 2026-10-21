@@ -245,7 +245,7 @@ class TrainEngine:
         micro_batch_results = []
 
         data_batch_info = self.model.pre_micro_batch_forward(data_batches)
-        total_loss = torch.tensor(0.0, device=DEVICE)
+        total_loss = torch.zeros((), device=DEVICE)
 
         try:
             if fsdp_accumulation_no_sync:
@@ -725,7 +725,7 @@ class TrainEngine:
         # total_loss directly, rather than iterating through fields to sum losses here.
         # This would provide better separation of concerns and make the loss computation logic
         # more explicit and maintainable.
-        loss = torch.tensor(0.0, device=DEVICE)
+        loss = torch.zeros((), device=DEVICE)
         for key in model_outputs.model_fields:
             value = getattr(model_outputs, key)
             if "loss" in key and isinstance(value, torch.Tensor):

@@ -19,7 +19,7 @@ class ChunkLoss(torch.autograd.Function):
             raise NotImplementedError("head_bias is not supported in ChunkLoss")
 
         device = hidden_states.device
-        accumulated_loss = torch.tensor(0.0, device=device)
+        accumulated_loss = torch.zeros((), device=device)
         grad_inputs = torch.empty_like(hidden_states)
         grad_weight = None
 
@@ -70,7 +70,7 @@ class ChunkLoss(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_output):
         grad_input, grad_weight = ctx.saved_tensors
-        if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
+        if torch.ne(grad_output[0], 1.0):
             grad_input = grad_input * grad_output[0]
             grad_weight = grad_weight * grad_output[0]
 

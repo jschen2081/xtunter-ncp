@@ -1231,13 +1231,13 @@ class BaseModel(nn.Module):
             res[i][loss_name] = ctx  # type: ignore
 
     def pre_micro_batch_forward(self, data_batches: Sequence[ModelItem]) -> DataBatchInfo:
-        step_consumed_tokens = torch.tensor(0, device=DEVICE)
+        step_consumed_tokens = torch.zeros((), device=DEVICE, dtype=torch.long)
         step_seqlen_tokens = 0
-        step_consumed_img_tokens = torch.tensor(0.0, device=DEVICE)
-        efficient_forward_tokens = torch.tensor(0, device=DEVICE, dtype=torch.long)
-        total_forward_tokens = torch.tensor(0, device=DEVICE, dtype=torch.long)
-        img_efficient_forward_tokens = torch.tensor(0, device=DEVICE, dtype=torch.long)
-        img_total_forward_tokens = torch.tensor(0, device=DEVICE, dtype=torch.long)
+        step_consumed_img_tokens = torch.zeros((), device=DEVICE)
+        efficient_forward_tokens = torch.zeros((), device=DEVICE, dtype=torch.long)
+        total_forward_tokens = torch.zeros((), device=DEVICE, dtype=torch.long)
+        img_efficient_forward_tokens = torch.zeros((), device=DEVICE, dtype=torch.long)
+        img_total_forward_tokens = torch.zeros((), device=DEVICE, dtype=torch.long)
 
         for data in data_batches:
             seq_ctx = data["seq_ctx"]
@@ -1275,7 +1275,6 @@ class BaseModel(nn.Module):
     def post_micro_batch_forward(self, batch_outputs: Sequence[ModelOutputs]) -> BatchForwardInfo:
         train_engine_extra_info = ModelForwardExtraLogInfo()
 
-        local_total_loss = torch.tensor(0.0, device=DEVICE)
         reduced_other_losses: dict[str, float] = {}
 
         for output in batch_outputs:
@@ -1284,7 +1283,6 @@ class BaseModel(nn.Module):
                 obj = getattr(output_copy, name)
                 if "loss" in name and isinstance(obj, torch.Tensor):
                     loss_item = obj.item()
-                    local_total_loss += loss_item
                     reduced_name = f"reduced_{name}"
 
                     if reduced_name not in reduced_other_losses:
