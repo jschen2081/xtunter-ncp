@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from test_native_sp1_replay import alignment_training_environment  # noqa: F401
 import torch
 
 
@@ -230,11 +232,11 @@ class TestNativeSP8Replay:
             f"#!{sys.executable}\nimport json, os, runpy, sys\n"
             "with open(os.environ['CALL_LOG'], 'a') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if sys.argv[1].endswith('/kernel_config.py'):\n"
+            "if sys.argv[1].endswith('/training_environment.py'):\n"
             "    runpy.run_path(sys.argv[1], run_name='__main__')\n"
             "else:\n"
             "    assert os.environ['XTUNER_GDN_CUSTOM_OP'] == 'true'\n"
-            "    assert os.environ['NCP_Q35V2_TRITON_DUAL_CROSS_MUDD'] == '0'\n"
+            "    assert os.environ['NCP_Q35V2_TRITON_DUAL_CROSS_MUDD'] == '1'\n"
             "    assert 'XTUNER_HF_IMPL' not in os.environ\n"
         )
         recorder.chmod(0o755)
@@ -247,7 +249,7 @@ class TestNativeSP8Replay:
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         sp_size = 8 if arguments else 1
         assert len(calls) == 5
-        assert calls[0] == [str(SCRIPTS / "kernel_config.py")]
+        assert calls[0] == [str(SCRIPTS / "training_environment.py")]
         assert calls[2][0] == str(SCRIPTS / "replay_xtuner.py")
         assert calls[3][:2] == ["-m", "torch.distributed.run"]
         assert "xtuner.v1.train.cli.sft" in calls[3]

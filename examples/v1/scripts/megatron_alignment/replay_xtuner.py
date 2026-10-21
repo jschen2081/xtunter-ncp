@@ -3,10 +3,12 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
+from training_environment import capture_training_environment
 from recorded_batch_source import WORLD_SIZE, capture_metadata
-from train_qwen35 import collect_metrics
+from train_qwen35 import collect_metrics, env_bool
 
 
 def prepare_replay(args: argparse.Namespace) -> Path:
@@ -57,13 +59,17 @@ def prepare_replay(args: argparse.Namespace) -> Path:
     )
     output.mkdir()
     config_path = output / "training_config.json"
+    config["kernel_env"] = capture_training_environment()
     config_path.write_text(json.dumps(config, indent=2))
     scripts = args.xtuner_root.resolve() / "examples/v1/scripts/megatron_alignment"
     recipe = (
         "import json\nimport sys\nfrom pathlib import Path\n"
         f"sys.path.insert(0, {str(scripts)!r})\n"
+        "from training_environment import validate_training_environment\n"
+        f"_recipe = json.loads(Path({str(config_path)!r}).read_text())\n"
+        "validate_training_environment(_recipe.get(\"kernel_env\"))\n"
         "from replay_trainer_config import build_replay_config\n"
-        f"trainer = build_replay_config(json.loads(Path({str(config_path)!r}).read_text()))\n"
+        "trainer = build_replay_config(_recipe)\n"
     )
     target = output / "trainer_config.py"
     target.write_text(recipe)
@@ -179,28 +185,38 @@ def collect_replay(root: Path, sp_size: int = 1) -> None:
 
 def main() -> None:
     """Prepare configuration or collect metrics; training runs through the CLI."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--xtuner-root", type=Path, default=Path(__file__).resolve().parents[4])
-    parser.add_argument("--sp-size", type=int, choices=(1, 8), default=1)
+    parser.add_argument("--sp-size", type=int, choices=(1, 8), default=os.environ.get("SP_SIZE", "1"))
     parser.add_argument("--hf-path", type=Path)
-    parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=3)
-    parser.add_argument("--recompute-ratio", type=float, default=1.0)
-    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--gradient-accumulation-no-sync", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--profile-trace", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--profile-step", type=int, default=7)
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--lr", type=float, default=8e-4)
-    parser.add_argument("--min-lr", type=float, default=8e-5)
+    parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=os.environ.get("ZERO_STAGE", "3"))
+    parser.add_argument("--recompute-ratio", type=float, default=os.environ.get("RECOMPUTE_RATIO", "1.0"))
     parser.add_argument(
-        "--lr-decay-style", type=str.lower, choices=("wsd", "cosine", "linear", "constant"), default="wsd"
+        "--lm-head-chunk-size", type=int, default=os.environ.get("LOSS_CHUNK_SIZE", "4096"),
+        help="Tokens per LM-head CE chunk",
     )
-    parser.add_argument("--warmup-iters", type=int, default=2000)
-    parser.add_argument("--decay-iters", type=int, default=143052)
-    parser.add_argument("--wsd-decay-iters", type=int, default=14306)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_COMPILE", False))
+    parser.add_argument(
+        "--gradient-accumulation-no-sync", action=argparse.BooleanOptionalAction,
+        default=env_bool("GRADIENT_ACCUMULATION_NO_SYNC", False),
+    )
+    parser.add_argument("--profile-trace", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_TRACE", False))
+    parser.add_argument("--profile-step", type=int, default=7)
+    parser.add_argument("--seed", type=int, default=os.environ.get("SEED", "1234"))
+    parser.add_argument("--lr", type=float, default=os.environ.get("LR", "8e-4"))
+    parser.add_argument("--min-lr", type=float, default=os.environ.get("MIN_LR", "8e-5"))
+    parser.add_argument(
+        "--lr-decay-style", type=str.lower, choices=("wsd", "cosine", "linear", "constant"),
+        default=os.environ.get("LR_DECAY_STYLE", "wsd"),
+    )
+    parser.add_argument("--warmup-iters", type=int, default=os.environ.get("LR_WARMUP_ITERS", "2000"))
+    parser.add_argument("--decay-iters", type=int, default=os.environ.get("LR_DECAY_ITERS", "143052"))
+    parser.add_argument("--wsd-decay-iters", type=int, default=os.environ.get("LR_WSD_DECAY_ITERS", "14306"))
     parser.add_argument("--collect-metrics", action="store_true")
     args = parser.parse_args()
+    if args.lm_head_chunk_size <= 0:
+        parser.error("lm-head-chunk-size must be positive")
     if args.collect_metrics:
         collect_replay(args.run_dir, args.sp_size)
     else:

@@ -7,16 +7,33 @@ through xtuner.v1.train.cli.sft, which calls Trainer.fit().
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kernel_config import configure_training_kernels
+from training_environment import capture_training_environment
 from runtime_requirements import require_fla_version
 
 
 if TYPE_CHECKING:
     from xtuner.v1.datasets.config import DataloaderConfig
     from xtuner.v1.train import TrainerConfig
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """Read a boolean launcher setting from the environment.
+
+    Args:
+        name (str): Environment variable name.
+        default (bool): Value when the variable is unset.
+
+    Returns:
+        bool: Parsed environment setting.
+    """
+    value = os.environ.get(name, str(default)).lower()
+    if value not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value in ("1", "true", "yes", "on")
 
 
 def build_trainer_config(
@@ -33,7 +50,7 @@ def build_trainer_config(
     Returns:
         TrainerConfig: Configuration consumed by the standard CLI and Trainer.
     """
-    configure_training_kernels()
+    capture_training_environment()
     require_fla_version()
 
     import torch
@@ -90,7 +107,9 @@ def build_trainer_config(
             num_workers=config["num_workers"],
             pack_workers=config["pack_workers"],
         )
-    lm_loss = CELossConfig(mode="chunk", chunk_size=128, loss_reduction="token")
+    lm_loss = CELossConfig(
+        mode="chunk", chunk_size=config.get("lm_head_chunk_size", 128), loss_reduction="token"
+    )
     return TrainerConfig(
         load_from=config["hf_path"],
         tokenizer_path=config["tokenizer_path"],
@@ -195,31 +214,38 @@ def collect_metrics(run_dir: Path) -> None:
 
 def main() -> None:
     """Prepare configuration on CPU; use the standard CLI for GPU training."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--xtuner-root", type=Path, default=Path(__file__).resolve().parents[4])
-    parser.add_argument("--recompute-ratio", type=float, default=1.0)
+    parser.add_argument("--recompute-ratio", type=float, default=os.environ.get("RECOMPUTE_RATIO", "1.0"))
+    parser.add_argument(
+        "--lm-head-chunk-size", type=int, default=os.environ.get("LOSS_CHUNK_SIZE", "4096"),
+        help="Tokens per LM-head CE chunk",
+    )
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=env_bool("ENABLE_COMPILE", False),
         help="Enable the model default torch.compile configuration",
     )
-    parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=3)
-    parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8), default=1)
-    parser.add_argument("--gradient-accumulation-no-sync", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--profile-trace", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=os.environ.get("ZERO_STAGE", "3"))
+    parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8), default=os.environ.get("SP_SIZE", "1"))
+    parser.add_argument(
+        "--gradient-accumulation-no-sync", action=argparse.BooleanOptionalAction,
+        default=env_bool("GRADIENT_ACCUMULATION_NO_SYNC", False),
+    )
+    parser.add_argument("--profile-trace", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_TRACE", False))
     base = Path("/mnt/shared-storage-user/llmrazor-share/heqiushi")
     parser.add_argument("--hf-path", type=Path, default=base / "ncp/qwen35/ncp_qwen35_v2_2551e48_iter0000002_hf")
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--global-batch-size", type=int, default=128)
-    parser.add_argument("--sequence-length", type=int, default=8192)
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--lr", type=float, default=8e-4)
-    parser.add_argument("--min-lr", type=float, default=8e-5)
-    parser.add_argument("--warmup-iters", type=int, default=2000)
-    parser.add_argument("--decay-iters", type=int, default=143052)
-    parser.add_argument("--wsd-decay-iters", type=int, default=14306)
+    parser.add_argument("--steps", type=int, default=os.environ.get("TRAIN_ITERS", "100"))
+    parser.add_argument("--global-batch-size", type=int, default=os.environ.get("GLOBAL_BATCH_SIZE", "128"))
+    parser.add_argument("--sequence-length", type=int, default=os.environ.get("SEQ_LENGTH", "8192"))
+    parser.add_argument("--seed", type=int, default=os.environ.get("SEED", "1234"))
+    parser.add_argument("--lr", type=float, default=os.environ.get("LR", "8e-4"))
+    parser.add_argument("--min-lr", type=float, default=os.environ.get("MIN_LR", "8e-5"))
+    parser.add_argument("--warmup-iters", type=int, default=os.environ.get("LR_WARMUP_ITERS", "2000"))
+    parser.add_argument("--decay-iters", type=int, default=os.environ.get("LR_DECAY_ITERS", "143052"))
+    parser.add_argument("--wsd-decay-iters", type=int, default=os.environ.get("LR_WSD_DECAY_ITERS", "14306"))
     parser.add_argument("--text-manifest", type=Path)
     parser.add_argument("--data-format", choices=("indexed", "text"), default="indexed")
     parser.add_argument(
@@ -245,13 +271,15 @@ def main() -> None:
         "--lr-decay-style",
         type=str.lower,
         choices=("wsd", "cosine", "linear", "constant"),
-        default="wsd",
+        default=os.environ.get("LR_DECAY_STYLE", "wsd"),
     )
     parser.add_argument(
         "--profile-step", type=int, default=7, help="First one-based update of the two-step profiling window"
     )
     parser.add_argument("--collect-metrics", action="store_true", help="Export native logs after CLI training")
     args = parser.parse_args()
+    if args.lm_head_chunk_size <= 0:
+        parser.error("lm-head-chunk-size must be positive")
     if args.collect_metrics:
         collect_metrics(args.run_dir)
         return
@@ -281,12 +309,16 @@ def main() -> None:
     config = {key: str(value.resolve()) if isinstance(value, Path) else value for key, value in vars(args).items()}
     args.run_dir.mkdir(parents=True)
     config_path = args.run_dir.resolve() / "training_config.json"
+    config["kernel_env"] = capture_training_environment()
     config_path.write_text(json.dumps(config, indent=2))
     recipe = (
         "import json\nimport sys\nfrom pathlib import Path\n"
         f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+        "from training_environment import validate_training_environment\n"
+        f"_recipe = json.loads(Path({str(config_path)!r}).read_text())\n"
+        "validate_training_environment(_recipe.get(\"kernel_env\"))\n"
         "from train_qwen35 import build_trainer_config\n"
-        f"trainer = build_trainer_config(json.loads(Path({str(config_path)!r}).read_text()))\n"
+        "trainer = build_trainer_config(_recipe)\n"
     )
     (args.run_dir / "trainer_config.py").write_text(recipe)
     (args.run_dir / "status").write_text("PREPARED\n")

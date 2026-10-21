@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from test_native_sp1_replay import alignment_training_environment  # noqa: F401
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +34,20 @@ OBSERVER = load_file("qwen35_observer", SCRIPTS / "qwen35_training_observer.py")
 
 
 class TestQwen35TrainerEntry:
+    @pytest.mark.parametrize("cli", [False, True])
+    def test_loss_chunk_size_environment_and_cli(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: bool,
+    ) -> None:
+        monkeypatch.setenv("LOSS_CHUNK_SIZE", "1024")
+        output = tmp_path / "run"
+        arguments = ["train_qwen35.py", "--run-dir", str(output)]
+        if cli:
+            arguments += ["--lm-head-chunk-size", "256"]
+        monkeypatch.setattr(sys, "argv", arguments)
+        ENTRY.main()
+        config = json.loads((output / "training_config.json").read_text())
+        assert config["lm_head_chunk_size"] == (256 if cli else 1024)
+
     @pytest.mark.parametrize("style", ["WSD", "cosine"])
     @pytest.mark.parametrize("sp", [1, 8])
     def test_cpu_preparation_and_native_cli_config(

@@ -217,6 +217,15 @@ class SelfMUDDRoute(nn.Module):
         return cast(Streams, outputs)
 
 
+def _cross_source_units(candidate_pool: tuple[Tensor, ...], eps: float) -> tuple[Tensor, ...]:
+    """Normalize an immutable source bank once per stack forward.
+
+    Keep this cache on the autograd graph: each route has its own scale, but
+    all routes in a group share the same source tensors and epsilon.
+    """
+    return tuple(F.rms_norm(source, (source.shape[-1],), None, eps) for source in candidate_pool)
+
+
 class CrossMUDDRoute(nn.Module):
     """Four-role cross route.
 
@@ -252,12 +261,19 @@ class CrossMUDDRoute(nn.Module):
         candidate_pool: tuple[Tensor, ...],
         streams: Streams,
         current_inv_rms: Tensor | None = None,
+        source_units: tuple[Tensor, ...] | None = None,
     ) -> Streams:
         if len(candidate_pool) != self.num_sources:
             raise ValueError(f"Cross-MUDD expected {self.num_sources} sources, got {len(candidate_pool)}")
         weights = self.route_weights(current_raw, current_inv_rms)
         gates = torch.tanh(self.gate_param)
-        sources = tuple(_mudd_rms_norm(source, self.source_norm_weight, self.eps) for source in candidate_pool)
+        if source_units is None:
+            sources = tuple(_mudd_rms_norm(source, self.source_norm_weight, self.eps) for source in candidate_pool)
+        else:
+            if len(source_units) != self.num_sources:
+                raise ValueError("Cross-MUDD cached source count differs from the source bank")
+            scale = _effective_weight(self.source_norm_weight)
+            sources = tuple(unit * scale for unit in source_units)
         outputs: list[Tensor] = []
         for role, stream in enumerate(streams):
             mixed = cast(
@@ -320,6 +336,7 @@ class ConceptLMQwen35V2Stack(nn.Module):
     ) -> None:
         super().__init__()
         self.block_size = config.self_mudd_block_size
+        self.cache_cross_source_rms = _env_on("NCP_Q35V2_CACHE_CROSS_SOURCE_RMS")
         # HF shares one inv-RMS using the tower layernorm epsilon, not the cross-route epsilon.
         self.route_eps = config.rms_norm_eps
         self.layers = nn.ModuleDict({str(index): self._build_layer(config, index) for index in range(depth)})
@@ -393,6 +410,17 @@ class ConceptLMQwen35V2Stack(nn.Module):
         use_dual_kernel = len(self.cross_route_groups) == 2 and _env_on("NCP_Q35V2_TRITON_DUAL_CROSS_MUDD")
         if use_dual_kernel and (self.training or torch.is_grad_enabled()):
             raise RuntimeError("Dual Cross-MUDD is inference-only; use eval() and disable autograd")
+        # Scope the cache to this invocation so weights/inputs cannot go stale
+        # across micro-batches, optimizer updates, or checkpoint recomputation.
+        use_source_cache = (
+            self.cache_cross_source_rms and _env_on("NCP_Q35V2_MUDD_RMS", "1") and not use_dual_kernel
+        )
+        source_units: tuple[tuple[Tensor, ...], ...] = ()
+        if use_source_cache:
+            source_units = tuple(
+                _cross_source_units(bank, routes[0].eps) if len(routes) else ()
+                for routes, bank in zip(self.cross_route_groups, cross_banks, strict=True)
+            )
         streams: Streams = (hidden_states,) * 4
         self_history: tuple[Tensor, ...] = (hidden_states,)
         raw_outputs: list[Tensor] = []
@@ -437,8 +465,11 @@ class ConceptLMQwen35V2Stack(nn.Module):
                     streams,
                 )
             else:
-                for routes, bank in zip(self.cross_route_groups, cross_banks, strict=True):
-                    streams = routes[index](current_raw, bank, streams, shared_inv_rms)
+                for group_index, (routes, bank) in enumerate(zip(self.cross_route_groups, cross_banks, strict=True)):
+                    if use_source_cache:
+                        streams = routes[index](current_raw, bank, streams, shared_inv_rms, source_units[group_index])
+                    else:
+                        streams = routes[index](current_raw, bank, streams, shared_inv_rms)
             if self.concept_routes is not None:
                 if aligned_predicted_concept is None:
                     raise ValueError("decoder concept injection requires concepts")

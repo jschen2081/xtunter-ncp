@@ -2,6 +2,8 @@
 
 import ast
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,31 @@ sys.path.insert(0, str(SCRIPTS))
 from batch_contract import batch_digest  # noqa: E402
 from recorded_batch_source import RecordedBatchSource, batch_path, capture_metadata, collated_update  # noqa: E402
 from replay_xtuner import collect_replay, main  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def alignment_training_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use shell defaults for direct Python recipe preparation in CPU tests."""
+    scripts = Path(__file__).resolve().parents[2] / "examples/v1/scripts"
+    module = scripts / "megatron_alignment/training_environment.py"
+    tree = ast.parse(module.read_text())
+    names = next(
+        ast.literal_eval(node.value) for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "TRAINING_ENV_NAMES" for target in node.targets)
+    )
+    launcher = (scripts / "run_qwen35_v2_9b_8gpu.sh").read_text()
+    block = launcher.split("# Kernel environment: caller values take precedence.\n", 1)[1]
+    block = block.split("# Validate before third-party imports.", 1)[0]
+    env = {name: value for name, value in os.environ.items() if name not in names}
+    command = block + "\n" + 'exec "$1" -c \'import json,os; print(json.dumps(dict(os.environ)))\''
+    result = subprocess.run(
+        ["bash", "-c", command, "bash", sys.executable],
+        env=env, check=True, capture_output=True, text=True,
+    )
+    effective = json.loads(result.stdout)
+    for name in names:
+        monkeypatch.setenv(name, effective[name])
 
 
 def make_capture(root: Path, steps: int = 3, micros: int = 2, length: int = 16) -> dict[str, int]:
@@ -111,6 +138,16 @@ def adapter_namespace() -> dict[str, Any]:
 
 
 class TestNativeSP1Replay:
+    @pytest.mark.parametrize("cli", [False, True])
+    def test_loss_chunk_size_environment_and_cli(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: bool,
+    ) -> None:
+        monkeypatch.setenv("LOSS_CHUNK_SIZE", "1024")
+        make_capture(tmp_path)
+        extra = ("--lm-head-chunk-size", "256") if cli else ()
+        config = prepare(tmp_path, monkeypatch, *extra)
+        assert config["lm_head_chunk_size"] == (256 if cli else 1024)
+
     def test_order_and_cursor_resume(self, tmp_path: Path) -> None:
         metadata = make_capture(tmp_path)
         source = RecordedBatchSource(tmp_path, 3, metadata)

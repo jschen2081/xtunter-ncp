@@ -172,9 +172,9 @@ def main() -> None:
 
 
 def _configure_kernels() -> None:
-    from examples.v1.scripts.megatron_alignment.kernel_config import configure_training_kernels
+    from examples.v1.scripts.megatron_alignment.training_environment import capture_training_environment
 
-    configure_training_kernels()
+    capture_training_environment()
 
 
 def _load_engine(args: argparse.Namespace) -> Any:
