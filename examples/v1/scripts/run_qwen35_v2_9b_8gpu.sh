@@ -4,6 +4,8 @@ ulimit -n 65536
 
 # Training defaults exported to the Python configuration; caller values take precedence.
 export ZERO_STAGE="${ZERO_STAGE:-2}"
+# FSDP gradient reduction precision; parameter computation remains BF16.
+export REDUCE_DTYPE="${REDUCE_DTYPE:-fp32}"
 export GRADIENT_ACCUMULATION_NO_SYNC="${GRADIENT_ACCUMULATION_NO_SYNC:-1}"
 export ENABLE_COMPILE="${ENABLE_COMPILE:-1}"
 export RECOMPUTE_RATIO="${RECOMPUTE_RATIO:-0}"
@@ -96,7 +98,7 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
-echo "CONFIG: FA3=$XTUNER_USE_FA3 ZeRO=$ZERO_STAGE no_sync=$GRADIENT_ACCUMULATION_NO_SYNC compile=$ENABLE_COMPILE recompute_ratio=$RECOMPUTE_RATIO trace=$ENABLE_TRACE lm_head_chunk_size=$LOSS_CHUNK_SIZE"
+echo "CONFIG: reduce_dtype=$REDUCE_DTYPE FA3=$XTUNER_USE_FA3 ZeRO=$ZERO_STAGE no_sync=$GRADIENT_ACCUMULATION_NO_SYNC compile=$ENABLE_COMPILE recompute_ratio=$RECOMPUTE_RATIO trace=$ENABLE_TRACE lm_head_chunk_size=$LOSS_CHUNK_SIZE"
 # Explicit CLI arguments override the environment defaults.
 echo "OUTPUT=$OUT"
 "$PY" examples/v1/scripts/megatron_alignment/train_qwen35.py \

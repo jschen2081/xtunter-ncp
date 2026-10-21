@@ -191,6 +191,10 @@ def main() -> None:
     parser.add_argument("--sp-size", type=int, choices=(1, 8), default=os.environ.get("SP_SIZE", "1"))
     parser.add_argument("--hf-path", type=Path)
     parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=os.environ.get("ZERO_STAGE", "3"))
+    parser.add_argument(
+        "--reduce-dtype", type=str.lower, choices=("fp32", "bf16"),
+        default=os.environ.get("REDUCE_DTYPE", "fp32"), help="FSDP gradient reduction precision",
+    )
     parser.add_argument("--recompute-ratio", type=float, default=os.environ.get("RECOMPUTE_RATIO", "1.0"))
     parser.add_argument(
         "--lm-head-chunk-size", type=int, default=os.environ.get("LOSS_CHUNK_SIZE", "4096"),

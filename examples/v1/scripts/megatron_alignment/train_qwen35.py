@@ -143,7 +143,7 @@ def build_trainer_config(
             cpu_offload=False,
             gradient_accumulation_no_sync=config["gradient_accumulation_no_sync"],
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype={"fp32": torch.float32, "bf16": torch.bfloat16}[config.get("reduce_dtype", "fp32")],
             fp32_lm_head=False,
         ),
         dataloader_cfg=dataloader_cfg,
@@ -229,6 +229,10 @@ def main() -> None:
         help="Enable the model default torch.compile configuration",
     )
     parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=os.environ.get("ZERO_STAGE", "3"))
+    parser.add_argument(
+        "--reduce-dtype", type=str.lower, choices=("fp32", "bf16"),
+        default=os.environ.get("REDUCE_DTYPE", "fp32"), help="FSDP gradient reduction precision",
+    )
     parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8), default=os.environ.get("SP_SIZE", "1"))
     parser.add_argument(
         "--gradient-accumulation-no-sync", action=argparse.BooleanOptionalAction,
