@@ -59,6 +59,7 @@ from xtuner.v1.module.rms_norm.concept_qwen35 import (
 from xtuner.v1.module.rms_norm.concept_qwen35 import (
     mudd_rms_norm as _mudd_rms_norm,
 )
+from xtuner.v1.ops.mudd.source_scale import scale_source
 from xtuner.v1.ops.rms_norm.native_backward import rms_norm_native_backward
 from xtuner.v1.utils import get_device, log_rank0
 
@@ -274,7 +275,7 @@ class CrossMUDDRoute(nn.Module):
             if len(source_units) != self.num_sources:
                 raise ValueError("Cross-MUDD cached source count differs from the source bank")
             scale = _effective_weight(self.source_norm_weight)
-            sources = tuple(unit * scale for unit in source_units)
+            sources = tuple(scale_source(unit, scale) for unit in source_units)
         outputs: list[Tensor] = []
         for role, stream in enumerate(streams):
             mixed = cast(
