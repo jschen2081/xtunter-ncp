@@ -1,7 +1,23 @@
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import torch
 from torch.autograd import grad
+
+
+def linear_with_grad_accumulation(
+    hidden_states: torch.Tensor, head_weight: torch.Tensor, grad_weight_buffer: torch.Tensor
+) -> torch.Tensor:
+    """Compute a linear projection whose backward accumulates weight gradients.
+
+    Args:
+        hidden_states (torch.Tensor): Input with features in the last dimension.
+        head_weight (torch.Tensor): Projection weight.
+        grad_weight_buffer (torch.Tensor): Detached buffer containing earlier chunk gradients.
+
+    Returns:
+        torch.Tensor: Linear projection of the input.
+    """
+    return cast(torch.Tensor, _AccumulatingLinear.apply(hidden_states, head_weight, grad_weight_buffer))
 
 
 class ChunkLoss(torch.autograd.Function):
@@ -14,10 +30,12 @@ class ChunkLoss(torch.autograd.Function):
         loss_forward: Callable,
         loss_kwargs_chunks: list[Any],
         chunk_size: int,
+        loss_forward_accumulate: Callable | None = None,
     ):
         if head_bias is not None:
             raise NotImplementedError("head_bias is not supported in ChunkLoss")
 
+        ctx.num_inputs = len(ctx.needs_input_grad)
         device = hidden_states.device
         accumulated_loss = torch.zeros((), device=device)
         grad_inputs = torch.empty_like(hidden_states)
@@ -39,9 +57,24 @@ class ChunkLoss(torch.autograd.Function):
 
             with torch.enable_grad():
                 hidden_states_chunk.requires_grad_()
-                chunk_loss, (_, extra_info) = loss_forward(
-                    hidden_states_chunk, head_weight, None, loss_kwargs_chunks[i]
+                can_accumulate = (
+                    loss_forward_accumulate is not None
+                    and grad_weight is not None
+                    and hidden_states_chunk.is_cuda
+                    and hidden_states_chunk.dtype == head_weight.dtype == grad_weight.dtype
+                    and head_weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    and not torch.is_autocast_enabled()
                 )
+                if can_accumulate:
+                    assert loss_forward_accumulate is not None
+                    chunk_loss, (_, extra_info) = loss_forward_accumulate(
+                        hidden_states_chunk, head_weight, None, loss_kwargs_chunks[i],
+                        grad_weight_buffer=grad_weight,
+                    )
+                else:
+                    chunk_loss, (_, extra_info) = loss_forward(
+                        hidden_states_chunk, head_weight, None, loss_kwargs_chunks[i]
+                    )
                 if head_weight.requires_grad:
                     chunk_grad_input, chunk_grad_weight = grad(
                         chunk_loss, (hidden_states_chunk, head_weight), allow_unused=True
@@ -74,4 +107,27 @@ class ChunkLoss(torch.autograd.Function):
             grad_input = grad_input * grad_output[0]
             grad_weight = grad_weight * grad_output[0]
 
-        return grad_input, grad_weight, None, None, None, None
+        return (grad_input, grad_weight, None, None, None, None, None)[: ctx.num_inputs]
+
+
+class _AccumulatingLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any, hidden_states: torch.Tensor, head_weight: torch.Tensor, grad_weight_buffer: torch.Tensor
+    ) -> torch.Tensor:
+        ctx.save_for_backward(hidden_states, head_weight)
+        # This private buffer belongs to one ChunkLoss invocation. Its version changes
+        # on every chunk, so it must not be a saved tensor checked by autograd.
+        ctx.grad_weight_buffer = grad_weight_buffer
+        return torch.nn.functional.linear(hidden_states, head_weight)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, None, None]:
+        hidden_states, head_weight = ctx.saved_tensors
+        grad_input = grad_output.matmul(head_weight) if ctx.needs_input_grad[0] else None
+        ctx.grad_weight_buffer.addmm_(
+            grad_output.reshape(-1, head_weight.shape[0]).t(),
+            hidden_states.reshape(-1, head_weight.shape[1]),
+        )
+        # The owning ChunkLoss returns the accumulated gradient once, after all chunks.
+        return grad_input, None, None
