@@ -1,3 +1,4 @@
+import os
 from typing import Any, Callable, cast
 
 import torch
@@ -36,6 +37,9 @@ class ChunkLoss(torch.autograd.Function):
             raise NotImplementedError("head_bias is not supported in ChunkLoss")
 
         ctx.num_inputs = len(ctx.needs_input_grad)
+        accumulate_enabled = os.environ.get("XTUNER_CHUNK_GRAD_ACCUMULATION", "false").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
         device = hidden_states.device
         accumulated_loss = torch.zeros((), device=device)
         grad_inputs = torch.empty_like(hidden_states)
@@ -58,7 +62,8 @@ class ChunkLoss(torch.autograd.Function):
             with torch.enable_grad():
                 hidden_states_chunk.requires_grad_()
                 can_accumulate = (
-                    loss_forward_accumulate is not None
+                    accumulate_enabled
+                    and loss_forward_accumulate is not None
                     and grad_weight is not None
                     and hidden_states_chunk.is_cuda
                     and hidden_states_chunk.dtype == head_weight.dtype == grad_weight.dtype

@@ -1,5 +1,6 @@
 """Tiled weight-gradient reduction for cached Cross-MUDD source scaling."""
 
+import os
 from typing import Any, cast
 
 import torch
@@ -17,9 +18,12 @@ def scale_source(x: Tensor, scale: Tensor) -> Tensor:
 
     Returns:
         Tensor: Scaled source, retaining ordinary multiplication semantics.
+
+    Set NCP_Q35V2_TRITON_SOURCE_SCALE=1 before compilation to opt in.
     """
     if (
-        x.device.type != "cuda"
+        os.environ.get("NCP_Q35V2_TRITON_SOURCE_SCALE", "0").strip().lower() not in {"1", "true", "yes", "on"}
+        or x.device.type != "cuda"
         or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
         or scale.dtype != x.dtype
     ):

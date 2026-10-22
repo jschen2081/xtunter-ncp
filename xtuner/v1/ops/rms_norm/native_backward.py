@@ -1,5 +1,6 @@
 """Keep CUDA RMSNorm backward native when its caller is compiled."""
 
+import os
 from typing import Any, cast
 
 import torch
@@ -17,8 +18,14 @@ def rms_norm_native_backward(x: Tensor, weight: Tensor | None, eps: float) -> Te
 
     Returns:
         Tensor: Normalized activations with the input shape and dtype.
+
+    Set NCP_Q35V2_NATIVE_RMS_BACKWARD=1 before compilation to opt in.
     """
-    if x.device.type != "cuda" or x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+    if (
+        os.environ.get("NCP_Q35V2_NATIVE_RMS_BACKWARD", "0").strip().lower() not in {"1", "true", "yes", "on"}
+        or x.device.type != "cuda"
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+    ):
         return F.rms_norm(x, (x.shape[-1],), weight, eps)
     return cast(Tensor, _NativeBackwardRMSNorm.apply(x, weight, eps))
 
