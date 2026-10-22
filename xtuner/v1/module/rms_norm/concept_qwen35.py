@@ -3,8 +3,9 @@
 import os
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
+
+from xtuner.v1.ops.rms_norm.native_backward import rms_norm_native_backward
 
 
 def env_on(name: str, default: str = "0") -> bool:
@@ -24,7 +25,7 @@ def eager_zero_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 def zero_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     """Differentiable zero-centered normalization used by the model."""
     if env_on("NCP_Q35V2_TORCH_RMS"):
-        return F.rms_norm(x, (weight.numel(),), effective_weight(weight), eps)
+        return rms_norm_native_backward(x, effective_weight(weight), eps)
     return eager_zero_rms_norm(x, weight, eps)
 
 
@@ -38,7 +39,7 @@ def mudd_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     }
     if not enabled:
         return eager_zero_rms_norm(x, weight, eps)
-    return F.rms_norm(x, (weight.numel(),), effective_weight(weight), eps)
+    return rms_norm_native_backward(x, effective_weight(weight), eps)
 
 
 class ZeroCenteredRMSNorm(nn.Module):
@@ -58,7 +59,7 @@ class GatedDeltaNetInputRMSNorm(ZeroCenteredRMSNorm):
 
     def forward(self, x: Tensor) -> Tensor:
         if env_on("NCP_Q35V2_GDN_TORCH_INPUT_NORM", "1"):
-            return F.rms_norm(x, (self.weight.numel(),), effective_weight(self.weight), self.eps)
+            return rms_norm_native_backward(x, effective_weight(self.weight), self.eps)
         return super().forward(x)
 
 

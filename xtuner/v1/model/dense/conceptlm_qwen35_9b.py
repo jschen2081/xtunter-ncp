@@ -59,6 +59,7 @@ from xtuner.v1.module.rms_norm.concept_qwen35 import (
 from xtuner.v1.module.rms_norm.concept_qwen35 import (
     mudd_rms_norm as _mudd_rms_norm,
 )
+from xtuner.v1.ops.rms_norm.native_backward import rms_norm_native_backward
 from xtuner.v1.utils import get_device, log_rank0
 
 from .dense import DenseModelOutputs
@@ -223,7 +224,7 @@ def _cross_source_units(candidate_pool: tuple[Tensor, ...], eps: float) -> tuple
     Keep this cache on the autograd graph: each route has its own scale, but
     all routes in a group share the same source tensors and epsilon.
     """
-    return tuple(F.rms_norm(source, (source.shape[-1],), None, eps) for source in candidate_pool)
+    return tuple(rms_norm_native_backward(source, None, eps) for source in candidate_pool)
 
 
 class CrossMUDDRoute(nn.Module):
@@ -293,9 +294,7 @@ class PredictedConceptInjection(nn.Module):
         self.final_diag = nn.Parameter(torch.full((hidden_size,), 0.05))
 
     def forward(self, concept: Tensor) -> Tensor:
-        normalized = F.rms_norm(
-            concept, (self.norm.weight.numel(),), _effective_weight(self.norm.weight), self.norm.eps
-        )
+        normalized = rms_norm_native_backward(concept, _effective_weight(self.norm.weight), self.norm.eps)
         return normalized * self.final_diag
 
 
