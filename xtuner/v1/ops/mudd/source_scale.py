@@ -18,7 +18,13 @@ def scale_source(x: Tensor, scale: Tensor) -> Tensor:
     Returns:
         Tensor: Scaled source, retaining ordinary multiplication semantics.
     """
-    if x.device.type != "cuda" or x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+    if (
+        x.device.type != "cuda"
+        or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        or scale.dtype != x.dtype
+    ):
+        # Mixed dtypes promote in forward; only take the custom path when the
+        # backward cast to x.dtype is a no-op, keeping gradients eager-exact.
         return x * scale
     return cast(Tensor, _ScaleSource.apply(x, scale))
 
