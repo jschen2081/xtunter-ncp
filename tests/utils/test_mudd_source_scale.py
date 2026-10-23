@@ -8,6 +8,25 @@ from xtuner.v1.ops.mudd.source_scale import _ScaleSource, scale_source
 
 
 class TestMuddSourceScale:
+    @pytest.fixture(autouse=True)
+    def enable_source_scale(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NCP_Q35V2_TRITON_SOURCE_SCALE", "1")
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("enabled", [None, "0", "1"])
+    def test_switch_controls_custom_backward(self, monkeypatch: pytest.MonkeyPatch, enabled: str | None) -> None:
+        if enabled is None:
+            monkeypatch.delenv("NCP_Q35V2_TRITON_SOURCE_SCALE")
+        else:
+            monkeypatch.setenv("NCP_Q35V2_TRITON_SOURCE_SCALE", enabled)
+        x = torch.randn(1, 17, 65, device="cuda", requires_grad=True)
+        w = torch.randn(65, device="cuda", requires_grad=True)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+            scale_source(x, w).sum().backward()
+        keys = {event.key for event in profiler.key_averages()}
+        assert ("xtuner::mudd_scale_weight_gradient" in keys) == (enabled == "1")
+
     @pytest.mark.parametrize("shape", [(65,), (17, 65), (2, 17, 65)])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("device", ["cpu", "cuda"])

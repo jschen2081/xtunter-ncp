@@ -10,6 +10,10 @@ from xtuner.v1.loss.chunk_loss import ChunkLoss
 
 
 class TestChunkGradAccumulation:
+    @pytest.fixture(autouse=True)
+    def enable_chunk_accumulation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("XTUNER_CHUNK_GRAD_ACCUMULATION", "true")
+
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -52,11 +56,16 @@ class TestChunkGradAccumulation:
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_uses_addmm_after_first_chunk(self) -> None:
+    @pytest.mark.parametrize("enabled", [None, "false", "true"])
+    def test_uses_addmm_after_first_chunk(self, monkeypatch: pytest.MonkeyPatch, enabled: str | None) -> None:
+        if enabled is None:
+            monkeypatch.delenv("XTUNER_CHUNK_GRAD_ACCUMULATION")
+        else:
+            monkeypatch.setenv("XTUNER_CHUNK_GRAD_ACCUMULATION", enabled)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
             self._compare(torch.bfloat16, "tail_padded", "cuda")
         counts = {event.key: event.count for event in profiler.key_averages()}
-        assert counts["aten::addmm_"] == 2
+        assert counts.get("aten::addmm_", 0) == (2 if enabled == "true" else 0)
 
 
     @pytest.mark.gpu
