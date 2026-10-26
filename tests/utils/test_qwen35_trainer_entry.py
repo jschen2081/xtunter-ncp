@@ -187,15 +187,65 @@ class TestQwen35TrainerEntry:
 
 
 class TestConceptLMNativeContext:
-    def test_cpu_labels_follow_sequence_device(self) -> None:
+    @pytest.fixture
+    def loss_config(self):
         # Load the real loss classes while omitting package initializers only.
         base = load_ast("xtuner/v1/loss/base_loss_ctx.py", {"Parameter": lambda **kwargs: None}, ("cyclopts",))
         loss = load_ast("xtuner/v1/loss/conceptlm_loss.py", base, (
             "base_loss_ctx", "xtuner.v1.module.concept_quantizer", "xtuner.v1.module.concept_sequence",
         ))
+        return loss["ConceptLMLossConfig"]()
+
+    @staticmethod
+    def loss_data(lengths: list[int], sp_mesh=None):
+        boundaries = [0]
+        for length in lengths:
+            boundaries.append(boundaries[-1] + length)
+        return {
+            "seq_ctx": SimpleNamespace(
+                input_ids=torch.zeros(1, sum(lengths), dtype=torch.long),
+                cu_seq_lens_q=torch.tensor(boundaries, dtype=torch.int32),
+                sequence_parallel_mesh=sp_mesh,
+            ),
+            "shifted_labels": torch.zeros(1, sum(lengths), dtype=torch.long),
+        }
+
+    @pytest.mark.parametrize("chunk_size", [2, 4, 8])
+    @pytest.mark.parametrize("chunks_per_document", [(1,), (2, 1), (1, 2), (0, 2)])
+    def test_rejects_documents_padded_to_two_chunks(self, loss_config, chunk_size, chunks_per_document):
+        loss_config.concept_chunk_size = chunk_size
+        data = self.loss_data([chunks * chunk_size for chunks in chunks_per_document])
+        with pytest.raises(ValueError, match="at least 2 concept chunks.*model padding"):
+            loss_config.build(data)
+
+    def test_rejects_unaligned_document(self, loss_config):
+        with pytest.raises(ValueError, match="align to concept chunks"):
+            loss_config.build(self.loss_data([10]))
+
+    @pytest.mark.parametrize("sp_size", [2, 4, 8])
+    @pytest.mark.parametrize("from_context", [False, True])
+    def test_rejects_sp_tail_padding(self, loss_config, sp_size, from_context):
+        mesh = SimpleNamespace(size=lambda: sp_size)
+        # Each document is at least two chunks, but the global total needs SP padding.
+        data = self.loss_data([8, sp_size * 4 + 4], mesh if from_context else None)
+        with pytest.raises(ValueError, match="SP size.*model tail padding"):
+            loss_config.build(data, sp_mesh=None if from_context else mesh)
+
+    @pytest.mark.parametrize("chunk_size", [2, 4, 8])
+    @pytest.mark.parametrize("sp_size", [1, 2, 4, 8])
+    def test_accepts_aligned_documents_without_model_padding(self, loss_config, chunk_size, sp_size):
+        loss_config.concept_chunk_size = chunk_size
+        lengths = [2 * chunk_size * sp_size] * 2
+        data = self.loss_data(lengths)
+        result = loss_config.build(data, sp_mesh=SimpleNamespace(size=lambda: sp_size))
+        assert result is not None
+        torch.testing.assert_close(result.loss_kwargs.boundaries, data["seq_ctx"].cu_seq_lens_q)
+        torch.testing.assert_close(result.loss_kwargs.loss_mask, data["shifted_labels"].ne(-100))
+
+    def test_cpu_labels_follow_sequence_device(self, loss_config) -> None:
         labels = torch.zeros(1, 8, dtype=torch.long)
         context = SimpleNamespace(input_ids=torch.empty(1, 8, device="meta"),
                                   cu_seq_lens_q=torch.tensor([0, 8]))
-        result = loss["ConceptLMLossConfig"]().build({"seq_ctx": context, "shifted_labels": labels})
+        result = loss_config.build({"seq_ctx": context, "shifted_labels": labels})
         assert result.loss_kwargs.loss_mask.device.type == "meta"
         assert labels.device.type == "cpu"

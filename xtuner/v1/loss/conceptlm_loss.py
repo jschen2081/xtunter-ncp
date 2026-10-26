@@ -72,10 +72,26 @@ class ConceptLMLossConfig(BaseLossConfig):
             raise ValueError("ConceptLM and LM target masks must agree")
         boundaries = seq_ctx.cu_seq_lens_q
         lengths = boundaries[1:] - boundaries[:-1]
-        if torch.any(lengths <= 0) or torch.any(lengths % self.concept_chunk_size):
+        if torch.any(lengths < 2 * self.concept_chunk_size):
+            raise ValueError(
+                "ConceptLM loss requires each document to contain at least 2 concept chunks "
+                f"({2 * self.concept_chunk_size} tokens); model padding of shorter documents "
+                "would change the concept count and invalidate the loss mask"
+            )
+        if torch.any(lengths % self.concept_chunk_size):
             raise ValueError("ConceptLM sequence lengths must align to concept chunks")
         if boundaries[0].item() != 0 or boundaries[-1].item() != mask.shape[1]:
             raise ValueError("ConceptLM boundaries must cover all tokens")
+        if sp_mesh is None:
+            sp_mesh = getattr(seq_ctx, "sequence_parallel_mesh", None)
+        sp_size = sp_mesh.size() if sp_mesh is not None else 1
+        alignment = sp_size * self.concept_chunk_size
+        if mask.shape[1] % alignment:
+            raise ValueError(
+                f"ConceptLM loss requires total tokens ({mask.shape[1]}) to be divisible by "
+                f"SP size ({sp_size}) * concept chunk size ({self.concept_chunk_size}) = {alignment}; "
+                "model tail padding would change the concept count and invalidate the loss mask"
+            )
         # Native Trainer keeps collated labels on CPU; the context owns its
         # device-local mask, as the CE context does. Preserve full SP masks.
         mask = mask.to(seq_ctx.input_ids.device)

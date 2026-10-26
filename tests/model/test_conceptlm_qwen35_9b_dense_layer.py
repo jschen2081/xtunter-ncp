@@ -116,6 +116,30 @@ def _manual_dense_forward(
 
 
 class TestConceptLMQwen35V2DenseLayer:
+    @pytest.mark.parametrize("megatron_compatible", [False, True])
+    def test_conv_weights_follow_megatron_adamw_routing(
+        self, config: _TinyV2Config, monkeypatch: pytest.MonkeyPatch, megatron_compatible: bool,
+    ) -> None:
+        from xtuner.v1.config.optim import MuonConfig
+
+        model = config.build()
+        conv_weights = {
+            name: param for name, param in model.named_parameters() if name.endswith(".self_attn.conv1d.weight")
+        }
+        assert len(conv_weights) == 5  # Three encoder GDN layers, one predictor and one decoder.
+        metadata = model.get_muon_metadata()
+        for param in conv_weights.values():
+            assert metadata["param_options"][param] == {"algorithm": "adamw", "weight_decay": 0.1}
+
+        # Parameter grouping is CPU-only and does not need a process group.
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        optimizer = MuonConfig(megatron_compatible=megatron_compatible, weight_decay=0.03).build(model)
+        groups = {id(param): group for group in optimizer.param_groups for param in group["params"]}
+        for param in conv_weights.values():
+            group = groups[id(param)]
+            assert group["algorithm"] == ("adamw" if megatron_compatible else "muon")
+            assert group["weight_decay"] == (0.1 if megatron_compatible else 0.03)
+
     @pytest.mark.parametrize("layer_index", [0, 3])
     def test_dense_forward_preserves_v2_operation_order(self, config: _TinyV2Config, layer_index: int):
         torch.manual_seed(0)

@@ -748,8 +748,8 @@ class ConceptLMQwen35V2(BaseModel):
         for name, param in self.named_parameters():
             if name.endswith((".post_norm", ".post_norm_weight", ".static_weight", ".static_logits")):
                 scalar[param] = 0.0
-            elif name.endswith(".attention.conv1d.weight") or name == "fusion_alpha":
-                # Megatron conv is 3D, xTuner stores its equivalent 2D kernel.
+            elif name.endswith(".self_attn.conv1d.weight") or name == "fusion_alpha":
+                # Match torch module names; HF export renames self_attn to attention.
                 # Megatron fusion_alpha is 0D (weight decay enabled), xTuner is [1].
                 scalar[param] = 0.1
         for module in self.modules():
