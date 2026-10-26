@@ -1,3 +1,4 @@
+from . import inductor_qwen35_reduction
 from . import torch_shape_env_simplify_pt28
 from .dcp_async_port import patch_dcp_async_daemon_port
 from .dcp_interleaved_planner import InterleavedShardLoadPlanner, InterleavedShardSavePlanner
