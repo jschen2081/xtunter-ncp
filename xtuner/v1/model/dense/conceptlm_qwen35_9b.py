@@ -225,7 +225,14 @@ def _cross_source_units(candidate_pool: tuple[Tensor, ...], eps: float) -> tuple
     Keep this cache on the autograd graph: each route has its own scale, but
     all routes in a group share the same source tensors and epsilon.
     """
-    return tuple(rms_norm_native_backward(source, None, eps) for source in candidate_pool)
+    # Weighted RMSNorm applies gamma before rounding to the activation dtype.
+    # Keep low-precision source units in FP32 until each route applies its scale.
+    return tuple(
+        rms_norm_native_backward(
+            source.float() if source.dtype in (torch.float16, torch.bfloat16) else source, None, eps
+        )
+        for source in candidate_pool
+    )
 
 
 class CrossMUDDRoute(nn.Module):
@@ -275,7 +282,10 @@ class CrossMUDDRoute(nn.Module):
             if len(source_units) != self.num_sources:
                 raise ValueError("Cross-MUDD cached source count differs from the source bank")
             scale = _effective_weight(self.source_norm_weight)
-            sources = tuple(scale_source(unit, scale) for unit in source_units)
+            sources = tuple(
+                scale_source(unit, scale.to(unit.dtype)).to(source.dtype)
+                for unit, source in zip(source_units, candidate_pool, strict=True)
+            )
         outputs: list[Tensor] = []
         for role, stream in enumerate(streams):
             mixed = cast(

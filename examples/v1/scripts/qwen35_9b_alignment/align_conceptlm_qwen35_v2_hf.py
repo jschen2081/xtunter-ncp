@@ -13,14 +13,14 @@ on rank 0's single GPU.
 Launch from the xtuner-ncp repo::
 
     torchrun --standalone --nproc-per-node=8 \\
-        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf.py
+        examples/v1/scripts/qwen35_9b_alignment/align_conceptlm_qwen35_v2_hf.py
 
     torchrun --standalone --nproc-per-node=8 \\
-        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf.py \\
+        examples/v1/scripts/qwen35_9b_alignment/align_conceptlm_qwen35_v2_hf.py \\
         --kernel-path production
 
     torchrun --standalone --nproc-per-node=8 \\
-        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_hf.py \\
+        examples/v1/scripts/qwen35_9b_alignment/align_conceptlm_qwen35_v2_hf.py \\
         --kernel-path production --lengths 8 128 --backward-length 8
 """
 
@@ -276,7 +276,7 @@ def use_hf_gdn_kernels() -> str:
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
 
-    gdn_ops.get_causal_conv1d_fn = lambda: fla_conv
+    gdn_ops.get_causal_conv1d_fn = lambda **_kwargs: fla_conv
     gdn_ops.get_chunk_gated_delta_rule_fn = lambda: fla_delta
     return "direct FLA calls"
 
@@ -545,12 +545,12 @@ def _distribution_version(name: str) -> str:
 
 
 def relax_hf_fla_pin(model) -> None:
-    """HF accepts CUDA GDN only when both FLA distributions are exactly 0.5.1."""
+    """Use the installed FLA kernels instead of the HF export's fla-core pin."""
     import importlib
 
     fla = _distribution_version("flash-linear-attention")
     core = _distribution_version("fla-core")
-    print(f"flash-linear-attention={fla}, fla-core={core}; HF requires both == 0.5.1")
+    print(f"flash-linear-attention={fla}, fla-core={core}; HF requires fla-core == 0.5.1")
 
     def kernels():
         from fla.modules.convolution import causal_conv1d

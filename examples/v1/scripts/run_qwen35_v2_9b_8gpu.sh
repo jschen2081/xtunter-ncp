@@ -28,7 +28,6 @@ export LR_DECAY_STYLE="${LR_DECAY_STYLE:-wsd}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BASE=/mnt/shared-storage-user/llmrazor-share/heqiushi
 DATA_PATH="${DATA_PATH:-/mnt/shared-storage-gpfs2/plm-gpfs/public_data_model/data/dolma3_mix-150B-1025/megatron_qwen35_8192/indexed}"
-CACHE="${DATA_CACHE_ROOT:-$BASE/xtuner_text_data_cache}"
 OUT="${WORK_DIR:-$BASE/xtuner_train_runs/qwen35_gbs128_zero2_fa3_nosync_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)}"
 # Resolve the output directory once, before chdir or any output-side effects.
 resolve_run_dir() {
@@ -80,17 +79,11 @@ export NCP_Q35V2_TRITON_DUAL_CROSS_MUDD="${NCP_Q35V2_TRITON_DUAL_CROSS_MUDD:-0}"
 # These launchers use the native implementation.
 unset XTUNER_HF_IMPL
 # Validate before third-party imports.
-"$PY" "$REPO/examples/v1/scripts/megatron_alignment/training_environment.py"
-"$PY" "$REPO/examples/v1/scripts/megatron_alignment/runtime_requirements.py"
+"$PY" "$REPO/examples/v1/scripts/qwen35_9b_alignment/training_environment.py"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/$(basename "$OUT")/triton}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/$(basename "$OUT")/inductor}"
 cd "$REPO"
-MANIFEST="${TEXT_MANIFEST:-}"
 FORMAT="${DATA_FORMAT:-indexed}"
-if [[ "$FORMAT" == text && -z "$MANIFEST" ]]; then
-  MANIFEST=$("$PY" examples/v1/scripts/megatron_alignment/prepare_qwen35_text_data.py \
-  --input "$DATA_PATH" --cache-root "$CACHE/normalized_text")
-fi
 finish() {
   rc=$?
   trap - EXIT
@@ -105,11 +98,10 @@ trap finish EXIT
 echo "CONFIG: reduce_dtype=$REDUCE_DTYPE FA3=$XTUNER_USE_FA3 ZeRO=$ZERO_STAGE no_sync=$GRADIENT_ACCUMULATION_NO_SYNC compile=$ENABLE_COMPILE recompute_ratio=$RECOMPUTE_RATIO trace=$ENABLE_TRACE lm_head_chunk_size=$LOSS_CHUNK_SIZE"
 # Explicit CLI arguments override the environment defaults.
 echo "OUTPUT=$OUT"
-"$PY" examples/v1/scripts/megatron_alignment/train_qwen35.py \
+"$PY" examples/v1/scripts/qwen35_9b_alignment/train_qwen35.py \
   --run-dir "$OUT" --data-format "$FORMAT" --data-path "$DATA_PATH" \
-  --text-manifest "$MANIFEST" --data-cache "$CACHE/tokenization" \
   "$@"
 
 "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=8 \
   -m xtuner.v1.train.cli.sft --config "$OUT/trainer_config.py"
-"$PY" examples/v1/scripts/megatron_alignment/train_qwen35.py --run-dir "$OUT" --collect-metrics
+"$PY" examples/v1/scripts/qwen35_9b_alignment/train_qwen35.py --run-dir "$OUT" --collect-metrics

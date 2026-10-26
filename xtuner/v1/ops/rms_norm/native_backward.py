@@ -25,6 +25,7 @@ def rms_norm_native_backward(x: Tensor, weight: Tensor | None, eps: float) -> Te
         os.environ.get("NCP_Q35V2_NATIVE_RMS_BACKWARD", "0").strip().lower() not in {"1", "true", "yes", "on"}
         or x.device.type != "cuda"
         or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or (weight is not None and weight.dtype != x.dtype)
     ):
         return F.rms_norm(x, (x.shape[-1],), weight, eps)
     return cast(Tensor, _NativeBackwardRMSNorm.apply(x, weight, eps))

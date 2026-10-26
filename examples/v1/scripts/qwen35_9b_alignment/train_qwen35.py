@@ -11,8 +11,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from training_environment import capture_training_environment
-from runtime_requirements import require_fla_version
+from training_environment import capture_training_environment, require_fla_version
 
 
 if TYPE_CHECKING:
@@ -66,38 +65,23 @@ def build_trainer_config(
 
     torch.set_float32_matmul_precision("medium")
     if dataloader_cfg is None:
-        indexed = config["data_format"] == "indexed"
-        if indexed:
-            datasets = [
-                {
-                    "dataset": DatasetConfig(
-                        anno_path=config["data_path"],
-                        class_name="MegatronIndexedDataset",
-                        name="tokenized",
-                        sequence_length=config["sequence_length"] + 1,
-                        enable_sequential_sampler=False,
-                    ),
-                    "tokenize_fn": PretrainTokenizeFunctionConfig(add_eos_token=False, add_bos_token=False),
-                }
-            ]
-        else:
-            files = json.loads(Path(config["text_manifest"]).read_text())
-            datasets = [
-                {
-                    "dataset": DatasetConfig(
-                        anno_path=item["normalized"],
-                        class_name="JsonlDataset",
-                        name=f"text_{index}",
-                        cache_dir=config["data_cache"],
-                        enable_sequential_sampler=False,
-                    ),
-                    "tokenize_fn": PretrainTokenizeFunctionConfig(add_eos_token=True, add_bos_token=False),
-                }
-                for index, item in enumerate(files)
-            ]
+        if config.get("data_format", "indexed") != "indexed":
+            raise ValueError("Independent training supports only indexed .bin/.idx data")
+        datasets = [
+            {
+                "dataset": DatasetConfig(
+                    anno_path=config["data_path"],
+                    class_name="MegatronIndexedDataset",
+                    name="tokenized",
+                    sequence_length=config["sequence_length"] + 1,
+                    enable_sequential_sampler=False,
+                ),
+                "tokenize_fn": PretrainTokenizeFunctionConfig(add_eos_token=False, add_bos_token=False),
+            }
+        ]
         dataloader_cfg = DataloaderConfig(
             dataset_config_list=datasets,
-            pack_level="none" if indexed else "hard",
+            pack_level="none",
             global_pack=True,
             pack_max_length=config["sequence_length"] + 1,
             pack_to_max_length=True,
@@ -107,9 +91,7 @@ def build_trainer_config(
             num_workers=config["num_workers"],
             pack_workers=config["pack_workers"],
         )
-    lm_loss = CELossConfig(
-        mode="chunk", chunk_size=config.get("lm_head_chunk_size", 128), loss_reduction="token"
-    )
+    lm_loss = CELossConfig(mode="chunk", chunk_size=config.get("lm_head_chunk_size", 128), loss_reduction="token")
     return TrainerConfig(
         load_from=config["hf_path"],
         tokenizer_path=config["tokenizer_path"],
@@ -219,7 +201,9 @@ def main() -> None:
     parser.add_argument("--xtuner-root", type=Path, default=Path(__file__).resolve().parents[4])
     parser.add_argument("--recompute-ratio", type=float, default=os.environ.get("RECOMPUTE_RATIO", "1.0"))
     parser.add_argument(
-        "--lm-head-chunk-size", type=int, default=os.environ.get("LOSS_CHUNK_SIZE", "4096"),
+        "--lm-head-chunk-size",
+        type=int,
+        default=os.environ.get("LOSS_CHUNK_SIZE", "4096"),
         help="Tokens per LM-head CE chunk",
     )
     parser.add_argument(
@@ -230,15 +214,21 @@ def main() -> None:
     )
     parser.add_argument("--zero-stage", type=int, choices=(2, 3), default=os.environ.get("ZERO_STAGE", "3"))
     parser.add_argument(
-        "--reduce-dtype", type=str.lower, choices=("fp32", "bf16"),
-        default=os.environ.get("REDUCE_DTYPE", "fp32"), help="FSDP gradient reduction precision",
+        "--reduce-dtype",
+        type=str.lower,
+        choices=("fp32", "bf16"),
+        default=os.environ.get("REDUCE_DTYPE", "fp32"),
+        help="FSDP gradient reduction precision",
     )
     parser.add_argument("--sp-size", type=int, choices=(1, 2, 4, 8), default=os.environ.get("SP_SIZE", "1"))
     parser.add_argument(
-        "--gradient-accumulation-no-sync", action=argparse.BooleanOptionalAction,
+        "--gradient-accumulation-no-sync",
+        action=argparse.BooleanOptionalAction,
         default=env_bool("GRADIENT_ACCUMULATION_NO_SYNC", False),
     )
-    parser.add_argument("--profile-trace", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_TRACE", False))
+    parser.add_argument(
+        "--profile-trace", action=argparse.BooleanOptionalAction, default=env_bool("ENABLE_TRACE", False)
+    )
     base = Path("/mnt/shared-storage-user/llmrazor-share/heqiushi")
     parser.add_argument("--hf-path", type=Path, default=base / "ncp/qwen35/ncp_qwen35_v2_2551e48_iter0000002_hf")
     parser.add_argument("--steps", type=int, default=os.environ.get("TRAIN_ITERS", "100"))
@@ -250,8 +240,7 @@ def main() -> None:
     parser.add_argument("--warmup-iters", type=int, default=os.environ.get("LR_WARMUP_ITERS", "2000"))
     parser.add_argument("--decay-iters", type=int, default=os.environ.get("LR_DECAY_ITERS", "143052"))
     parser.add_argument("--wsd-decay-iters", type=int, default=os.environ.get("LR_WSD_DECAY_ITERS", "14306"))
-    parser.add_argument("--text-manifest", type=Path)
-    parser.add_argument("--data-format", choices=("indexed", "text"), default="indexed")
+    parser.add_argument("--data-format", choices=("indexed",), default="indexed")
     parser.add_argument(
         "--data-path",
         type=Path,
@@ -260,7 +249,6 @@ def main() -> None:
             "dolma3_mix-150B-1025/megatron_qwen35_8192/indexed"
         ),
     )
-    parser.add_argument("--data-cache", type=Path, default=base / "xtuner_text_data_cache/tokenization")
     parser.add_argument(
         "--tokenizer-path",
         type=Path,
@@ -300,8 +288,6 @@ def main() -> None:
         parser.error("GBS must be divisible by the data parallel size")
     if args.profile_step <= 0:
         parser.error("profile-step must be positive")
-    if args.data_format == "text" and args.text_manifest is None:
-        parser.error("text input requires --text-manifest")
     if args.run_dir.exists():
         raise FileExistsError(f"Use a fresh output directory: {args.run_dir}")
     if args.warmup_iters < 0 or args.decay_iters <= args.warmup_iters:
@@ -320,7 +306,7 @@ def main() -> None:
         f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
         "from training_environment import validate_training_environment\n"
         f"_recipe = json.loads(Path({str(config_path)!r}).read_text())\n"
-        "validate_training_environment(_recipe.get(\"kernel_env\"))\n"
+        'validate_training_environment(_recipe.get("kernel_env"))\n'
         "from train_qwen35 import build_trainer_config\n"
         "trainer = build_trainer_config(_recipe)\n"
     )

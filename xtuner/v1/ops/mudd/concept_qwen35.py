@@ -145,6 +145,17 @@ if triton is not None:
                 value3 += _cross_mudd_mul(
                     scaled, tl.load(weights + weight_pointer + 3 * nsrc + source_index), bf16, fp16
                 )
+                # Eager's sequential sum rounds after every activation-dtype add.
+                if bf16:
+                    value0 = value0.to(tl.bfloat16).to(tl.float32)
+                    value1 = value1.to(tl.bfloat16).to(tl.float32)
+                    value2 = value2.to(tl.bfloat16).to(tl.float32)
+                    value3 = value3.to(tl.bfloat16).to(tl.float32)
+                elif fp16:
+                    value0 = value0.to(tl.float16).to(tl.float32)
+                    value1 = value1.to(tl.float16).to(tl.float32)
+                    value2 = value2.to(tl.float16).to(tl.float32)
+                    value3 = value3.to(tl.float16).to(tl.float32)
         tl.store(out0 + pointer, value0, mask=mask)
         tl.store(out1 + pointer, value1, mask=mask)
         tl.store(out2 + pointer, value2, mask=mask)

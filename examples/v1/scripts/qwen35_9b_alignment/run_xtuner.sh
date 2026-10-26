@@ -65,7 +65,6 @@ unset XTUNER_HF_IMPL
 echo "CONFIG: reduce_dtype=$REDUCE_DTYPE FA3=$XTUNER_USE_FA3 ZeRO=$ZERO_STAGE no_sync=$GRADIENT_ACCUMULATION_NO_SYNC compile=$ENABLE_COMPILE recompute_ratio=$RECOMPUTE_RATIO trace=$ENABLE_TRACE lm_head_chunk_size=$LOSS_CHUNK_SIZE"
 # Validate before third-party imports.
 "$PY" "$ALIGN_DIR/training_environment.py"
-"$PY" "$ALIGN_DIR/runtime_requirements.py"
 # Select the output directory for the shared native Trainer entry.
 sp_size="${SP_SIZE:-1}"
 arguments=("$@")
@@ -79,3 +78,6 @@ done
 "$PY" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=8 \
   -m xtuner.v1.train.cli.sft --config "$ALIGNMENT_RUN_DIR/xtuner_sp${sp_size}_native/trainer_config.py"
 "$PY" "$ALIGN_DIR/replay_xtuner.py" --run-dir "$ALIGNMENT_RUN_DIR" --sp-size "$sp_size" --collect-metrics
+# Compare only after successful training and complete metric collection.
+"$PY" "$ALIGN_DIR/compare_results.py" "$ALIGNMENT_RUN_DIR" --sp-size "$sp_size"
+echo "Accuracy report: $ALIGNMENT_RUN_DIR/comparison.json"

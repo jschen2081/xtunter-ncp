@@ -458,7 +458,9 @@ class NCPQwen35V2GatedDeltaNet(nn.Module):
         if qkv.is_cuda:
             from xtuner.v1.ops.gated_deltanet import get_causal_conv1d_fn
 
-            qkv = get_causal_conv1d_fn()(x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx)
+            qkv = get_causal_conv1d_fn(hf_backend="fla")(
+                x=qkv, weight=weight, bias=None, activation="silu", seq_idx=seq_idx
+            )
         else:
             qkv = _cpu_conv_documents(qkv, weight.to(qkv.dtype), seq_ctx.cu_seq_lens_q)
         sp_size = sp_mesh.size() if sp_mesh is not None else 1

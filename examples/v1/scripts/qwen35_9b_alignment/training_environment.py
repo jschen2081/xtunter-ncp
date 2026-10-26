@@ -5,7 +5,11 @@ preparing a recipe or importing packages that consume import-time switches.
 """
 
 import os
+import sys
 import warnings
+from importlib import import_module
+
+from packaging.version import InvalidVersion, Version
 
 
 # Names to validate and record, without Python-side defaults.
@@ -56,7 +60,9 @@ def validate_training_environment(snapshot: dict[str, str] | None) -> None:
         snapshot (dict[str, str] | None): Environment recorded during preparation.
     """
     if snapshot is None:
-        warnings.warn("Legacy recipe has no kernel_env snapshot; runtime environment cannot be verified.", stacklevel=2)
+        warnings.warn(
+            "Legacy recipe has no kernel_env snapshot; runtime environment cannot be verified.", stacklevel=2
+        )
         return
     if "XTUNER_USE_FA3" not in snapshot:
         warnings.warn("Legacy kernel_env does not record FA3; FA3 cannot be verified.", stacklevel=2)
@@ -72,7 +78,40 @@ def validate_training_environment(snapshot: dict[str, str] | None) -> None:
         )
 
 
+MIN_FLA_VERSION = Version("0.5.1")
+
+
+def require_fla_version() -> str:
+    """Validate the version of the FLA module selected by this Python environment.
+
+    Returns:
+        str: Version of the imported FLA module.
+    """
+    try:
+        fla = import_module("fla")
+    except Exception as error:
+        raise RuntimeError(
+            f"Qwen3.5 requires FLA >= {MIN_FLA_VERSION}; cannot import fla: {error}; Python={sys.executable}"
+        ) from error
+
+    actual = getattr(fla, "__version__", None)
+    context = f"found={actual!r}; module={getattr(fla, '__file__', '<unknown>')}; Python={sys.executable}"
+    try:
+        installed = Version(str(actual))
+    except InvalidVersion as error:
+        raise RuntimeError(
+            f"Qwen3.5 requires FLA >= {MIN_FLA_VERSION}; cannot determine a valid FLA version; {context}"
+        ) from error
+    if installed < MIN_FLA_VERSION:
+        raise RuntimeError(f"Qwen3.5 requires FLA >= {MIN_FLA_VERSION}; {context}")
+    print(f"FLA_VERSION_CHECK_OK {context}", flush=True)
+    return str(actual)
+
+
 if __name__ == "__main__":
-    # Validate and print the effective environment for launcher logs.
-    for name, value in capture_training_environment().items():
-        print(f"{name}={value}")
+    try:
+        for name, value in capture_training_environment().items():
+            print(f"{name}={value}")
+        require_fla_version()
+    except (RuntimeError, ValueError) as error:
+        raise SystemExit(str(error)) from None

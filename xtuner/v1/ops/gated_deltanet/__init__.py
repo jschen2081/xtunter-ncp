@@ -13,6 +13,9 @@ switch between fast / fused paths and HF-exact paths. Under `XTUNER_HF_IMPL=true
   binds the channel-last/seq_idx convention together via an internal transpose, which gives a
   different backward op graph from HF's call pattern even though forward is bitwise.
 
+`get_causal_conv1d_fn(hf_backend="fla")` selects the FLA eager convolution for
+NCP Qwen3.5 v2 HF parity, preserving packed document boundaries via ``cu_seqlens``.
+
 `XTUNER_GDN_CUSTOM_OP` independently overrides the delta-rule dispatcher, allowing
 compile-friendly custom ops while keeping the other HF implementations selected.
 
@@ -26,6 +29,10 @@ Shared FSDP helpers used by both ``GatedDeltaNet`` and ``KDA``:
 """
 
 import os
+from collections.abc import Callable
+from typing import Literal
+
+import torch
 
 
 _TRUTHY = {"true", "1", "yes", "on"}
@@ -65,6 +72,42 @@ def _hf_causal_conv1d_adapter(x, weight, bias, activation, seq_idx):
     return out.transpose(1, 2)
 
 
+def _fla_causal_conv1d_adapter(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    seq_idx: torch.Tensor | None,
+) -> torch.Tensor:
+    from fla.modules.convolution import causal_conv1d
+
+    cu_seqlens = None
+    original_shape = x.shape
+    if seq_idx is not None:
+        if seq_idx.shape != x.shape[:2]:
+            raise ValueError("seq_idx must match the convolution batch and sequence dimensions")
+        # Only the eager parity path converts sequence IDs to FLA document offsets.
+        # Leave ordinary batches unchanged to match the HF reference call exactly.
+        changes = seq_idx[:, 1:] != seq_idx[:, :-1]
+        if bool(changes.any()):
+            starts = torch.ones_like(seq_idx, dtype=torch.bool)
+            starts[:, 1:] = changes
+            offsets = starts.flatten().nonzero().flatten().to(torch.int32)
+            end = offsets.new_tensor([seq_idx.numel()])
+            cu_seqlens = torch.cat((offsets, end))
+            x = x.reshape(1, -1, x.shape[-1])
+    output, _ = causal_conv1d(
+        x,
+        weight,
+        bias=bias,
+        activation=activation,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+    )
+    return output.reshape(original_shape)
+
+
 def get_chunk_gated_delta_rule_fn():
     if not _custom_op_enabled():
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _hf_chunk_gated_delta_rule
@@ -81,9 +124,19 @@ def get_chunk_gated_delta_rule_fn():
     return _xtuner_chunk_gated_delta_rule
 
 
-def get_causal_conv1d_fn():
+def get_causal_conv1d_fn(*, hf_backend: Literal["cuda", "fla"] = "cuda") -> Callable[..., torch.Tensor]:
+    """Select convolution while preserving the production kernel dispatch.
+
+    Args:
+        hf_backend (Literal["cuda", "fla"]): Eager backend used only in HF mode.
+
+    Returns:
+        Callable: Convolution accepting channel-last inputs and sequence IDs.
+    """
+    if hf_backend not in {"cuda", "fla"}:
+        raise ValueError(f"Unsupported HF convolution backend: {hf_backend}")
     if _hf_impl_enabled():
-        return _hf_causal_conv1d_adapter
+        return _fla_causal_conv1d_adapter if hf_backend == "fla" else _hf_causal_conv1d_adapter
     if _npu_conv_enabled():
         from .causal_conv1d_npu import causal_conv1d as _npu_causal_conv1d
 

@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+from xtuner.v1.module.attention.concept_qwen35 import _cpu_conv_documents
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("activation", [None, "silu"])
@@ -66,3 +68,16 @@ def test_packed_document_gradients(activation, batch_size, channels, with_bias):
             torch.testing.assert_close(grads[2], expected_db, rtol=0, atol=0)
     finally:
         torch.use_deterministic_algorithms(old, warn_only=warn_only)
+
+
+@pytest.mark.parametrize("lengths", [[16], [3, 13]])
+def test_gdn_cpu_convolution_preserves_sp_head_shards(lengths: list[int]) -> None:
+    torch.manual_seed(11)
+    qkv = torch.randn(1, sum(lengths), 12)
+    weight = torch.randn(12, 4)
+    boundaries = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+    # One rank's channels from each of the Q, K and V projection blocks.
+    channels = torch.tensor([0, 1, 4, 5, 8, 9])
+    expected = _cpu_conv_documents(qkv, weight, boundaries).index_select(2, channels)
+    actual = _cpu_conv_documents(qkv.index_select(2, channels), weight.index_select(0, channels), boundaries)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -104,15 +104,14 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 
 ## xTuner 相对仓库根
 
-默认脚本目录 examples/v1/scripts/megatron_alignment/：
+默认脚本目录 examples/v1/scripts/qwen35_9b_alignment/：
 
 | 文件 | 职责 |
 |---|---|
 | replay_xtuner.py / run_xtuner.sh | 生产输入回放，SP1/SP8统一标准CLI → Trainer.fit；LR由xTuner scheduler独立计算 |
-| kernel_config.py | 独立训练、回放与SP验证共享的kernel策略，必须先于FLA/xTuner导入生效 |
-| batch_contract.py | 元数据、dtype/shape/内容指纹和mask/边界检查 |
+| training_environment.py | 启动环境快照校验与FLA运行时版本检查；默认值由启动sh提供 |
 | compare_results.py | completion、step/micro、targets、指纹、LR和误差报告 |
-| train_qwen35.py / replay_trainer_config.py / recorded_batch_source.py | 原生Trainer配置与捕获数据适配；SP组内按(micro,原rank)顺序读取相同完整输入，交由Trainer切分 |
+| train_qwen35.py / replay_xtuner.py | 独立训练配置与单文件回放入口；回放文件包含batch契约、数据读取和原生Trainer适配，SP组内按(micro,原rank)顺序读取相同完整输入，交由Trainer切分 |
 | ../run_qwen35_v2_9b_8gpu.sh | 独立八卡入口，默认SP1，SP_SIZE=8或--sp-size 8 |
 | probe_xtuner_gradients.py / locate_xtuner_gradients.py / gradient_probe_utils.py / layer_gradient_trace.py / compare_gradient_location.py | 诊断工具，与正式训练分离 |
 
@@ -124,11 +123,11 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 - xtuner/v1/ops/rms_norm/concept_qwen35.py：仅前向数值参考，训练norm不调用该算子。
 - xtuner/v1/module/concept_quantizer.py / concept_sequence.py：共享量化和HLM序列能力。
 - xtuner/v1/config/optim.py、xtuner/v1/optim/concept_qwen35_muon.py / muon.py：opt-in适配、共享通信和原有默认实现。
-- examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_sp_training.py：原SP测试；随机数据、AdamW/CE默认配置不等于生产对比recipe。
+- examples/v1/scripts/qwen35_9b_alignment/align_conceptlm_qwen35_v2_sp_training.py：原SP测试；随机数据、AdamW/CE默认配置不等于生产对比recipe。
 
 run_gradient_*、wait_then_run_nosync.sh、run_qwen35_controlled.sh可能等待GPU、绑定固定路径；先读代码，存在不等于获准执行。
 
-tests/optim/run_megatron_muon_cpu.py、tests/utils/_cpu_source_loader.py、test_megatron_alignment.py是低层回归，不在正式回放依赖链。source loader可能读取git show HEAD；用户仅限制暂存、修改暂存区或提交时，不应据此禁用该原有只读行为；用户明确禁止所有git调用时不能直接运行这条测试路径；Gloo测试reshape shim不应进入生产实现。
+tests/utils/test_qwen35_trainer_entry.py 内联的 load_ast 仅用于 CPU loss context 设备检查，跳过指定导入，不替换数值实现，不在正式训练或回放依赖链中。
 
 ## Megatron 相对其仓库根
 
@@ -176,9 +175,9 @@ export DATA_ROOT=/path/to/indexed_recipe
 TRAIN_ITERS=5 GLOBAL_BATCH_SIZE=8 \
   bash "$MEGATRON_ROOT/examples/conceptlm/framework_alignment/run_megatron.sh"
 # 切换到xTuner GPU环境，继承捕获目录。
-bash "$XTUNER_ROOT/examples/v1/scripts/megatron_alignment/run_xtuner.sh" \
+bash "$XTUNER_ROOT/examples/v1/scripts/qwen35_9b_alignment/run_xtuner.sh" \
   --sp-size 1 --compile --recompute-ratio 0
-python "$XTUNER_ROOT/examples/v1/scripts/megatron_alignment/compare_results.py" \
+python "$XTUNER_ROOT/examples/v1/scripts/qwen35_9b_alignment/compare_results.py" \
   "$ALIGNMENT_RUN_DIR" --sp-size 1
 ```
 

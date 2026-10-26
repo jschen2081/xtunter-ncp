@@ -4,7 +4,7 @@
 Run from the repository root with eight GPUs::
 
     PYTHONPATH=. torchrun --standalone --nproc-per-node=8 \
-        examples/v1/scripts/megatron_alignment/align_conceptlm_qwen35_v2_sp_training.py \
+        examples/v1/scripts/qwen35_9b_alignment/align_conceptlm_qwen35_v2_sp_training.py \
         --steps 5 --lengths 128 --output logs/ulysses-sp-training.json
 
 Every mode reloads the same checkpoint and starts a fresh AdamW optimizer.
@@ -36,9 +36,15 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 DEFAULT_CHECKPOINT = "/mnt/shared-storage-user/llmrazor-share/heqiushi/ncp/qwen35/ncp_qwen35_v2_2551e48_iter0000002_hf"
@@ -172,7 +178,7 @@ def main() -> None:
 
 
 def _configure_kernels() -> None:
-    from examples.v1.scripts.megatron_alignment.training_environment import capture_training_environment
+    from examples.v1.scripts.qwen35_9b_alignment.training_environment import capture_training_environment
 
     capture_training_environment()
 

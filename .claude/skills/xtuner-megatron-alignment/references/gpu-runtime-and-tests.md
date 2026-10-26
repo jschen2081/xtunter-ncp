@@ -108,7 +108,7 @@ ps -eo pid,ppid,args
 
 - 曾使用 `ssh sf_gpu_mg` 跑 Megatron、`ssh sf_gpu_xt` 跑 xTuner，两边共享 `/mnt/shared-storage-user/llmrazor-share/heqiushi/`。alias、IP 和可用资源会变化。
 - Megatron `examples/conceptlm/framework_alignment/run_megatron.sh` 用新的 `ALIGNMENT_RUN_DIR` 捕获；rerun 还需 `MEGATRON_REPLAY_SOURCE` 指向源捕获、`PRETRAIN_ENTRYPOINT` 指向同目录 `production_replay.py`。读取当前 preflight/CLI 后再组命令。
-- xTuner `examples/v1/scripts/megatron_alignment/run_xtuner.sh` 用 `ALIGNMENT_RUN_DIR` 传给 Python 入口的 `--run-dir`，读取已准备的回放目录。
+- xTuner `examples/v1/scripts/qwen35_9b_alignment/run_xtuner.sh` 用 `ALIGNMENT_RUN_DIR` 传给 Python 入口的 `--run-dir`，读取已准备的回放目录。
 - 历史 GBS128、MBS1、DP8、100 步捕获，每 rank 每步 16 个 micro，共 12800 个独立 batch；历史 GBS8 对应 800 个。使用其他拓扑或步数时重新计算，不能把这些数字写成通用验证常量。
 - 某些入口显式使用 `/usr/bin/python`，另有只覆盖 FLA 的 `venv-fla051`。按本次版本要求选择并验证；不是看到 venv 名就认定 Torch/TE/FLA 全部符合要求。
 

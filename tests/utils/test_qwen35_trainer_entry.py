@@ -1,10 +1,12 @@
-"""CPU checks for CLI preparation, native-loop scheduling and log export."""
+"""CPU checks for training configuration, LR timing and loss context devices."""
 
 import ast
 import contextlib
 import importlib.util
 import json
 import logging
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,13 +14,40 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
-from test_native_sp1_replay import alignment_training_environment  # noqa: F401
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS = ROOT / "examples/v1/scripts/megatron_alignment"
+SCRIPTS = ROOT / "examples/v1/scripts/qwen35_9b_alignment"
 sys.path.insert(0, str(SCRIPTS))
+
+
+@pytest.fixture(autouse=True)
+def alignment_training_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use shell defaults for direct Python recipe preparation in CPU tests."""
+    scripts = Path(__file__).resolve().parents[2] / "examples/v1/scripts"
+    module = scripts / "qwen35_9b_alignment/training_environment.py"
+    tree = ast.parse(module.read_text())
+    names = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "TRAINING_ENV_NAMES" for target in node.targets)
+    )
+    launcher = (scripts / "run_qwen35_v2_9b_8gpu.sh").read_text()
+    block = launcher.split("# Kernel environment: caller values take precedence.\n", 1)[1]
+    block = block.split("# Validate before third-party imports.", 1)[0]
+    env = {name: value for name, value in os.environ.items() if name not in names}
+    command = block + "\n" + "exec \"$1\" -c 'import json,os; print(json.dumps(dict(os.environ)))'"
+    result = subprocess.run(
+        ["bash", "-c", command, "bash", sys.executable],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    effective = json.loads(result.stdout)
+    for name in names:
+        monkeypatch.setenv(name, effective[name])
 
 
 def load_file(name: str, path: Path) -> Any:
@@ -28,9 +57,24 @@ def load_file(name: str, path: Path) -> Any:
     return module
 
 
+def load_ast(
+    relative: str, namespace: dict[str, Any], skip_imports: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Load real source while omitting selected imports for CPU-only tests."""
+    tree = ast.parse((ROOT / relative).read_text())
+    tree.body = [
+        node
+        for node in tree.body
+        if not (isinstance(node, ast.ImportFrom) and (node.module or "") in skip_imports)
+    ]
+    namespace = dict(namespace)
+    namespace.setdefault("__name__", "cpu_library_test")
+    exec(compile(tree, str(ROOT / relative), "exec"), namespace)
+    return namespace
+
+
 ENTRY = load_file("qwen35_cli_entry", SCRIPTS / "train_qwen35.py")
 SCHEDULER = load_file("qwen35_native_scheduler", ROOT / "xtuner/v1/utils/lr_scheduler.py")
-OBSERVER = load_file("qwen35_observer", SCRIPTS / "qwen35_training_observer.py")
 
 
 class TestQwen35TrainerEntry:
@@ -66,71 +110,24 @@ class TestQwen35TrainerEntry:
         ast.parse((output / "trainer_config.py").read_text())
 
     @pytest.mark.parametrize("sp", [1, 8])
-    @pytest.mark.parametrize("trace", [False, True])
     def test_prepared_recipe_builds_native_trainer_config(
-        self, tmp_path: Path, sp: int, trace: bool, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, sp: int, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         output = tmp_path / "run"
         arguments = [
             "train_qwen35.py", "--run-dir", str(output), "--sp-size", str(sp),
             "--zero-stage", "2", "--gradient-accumulation-no-sync", "--compile", "--recompute-ratio", "0",
         ]
-        if trace:
-            arguments.append("--profile-trace")
         monkeypatch.setattr(sys, "argv", arguments)
         monkeypatch.setattr(ENTRY, "require_fla_version", lambda: "0.5.1")
         ENTRY.main()
         recipe = ENTRY.build_trainer_config(json.loads((output / "training_config.json").read_text()))
         assert recipe.grad_norm_dtype == torch.float32
-        assert recipe.profile_step == ([6, 7] if trace else None)
         assert recipe.sp_size == sp
         assert recipe.total_step == 100
         assert not recipe.fsdp_cfg.reshard_after_forward
         assert recipe.fsdp_cfg.gradient_accumulation_no_sync
 
-    def test_export_retains_full_precision_lr_and_native_tags(self, tmp_path: Path) -> None:
-        config = {"steps": 2, "global_batch_size": 128, "sequence_length": 8192, "sp_size": 8}
-        (tmp_path / "training_config.json").write_text(json.dumps(config))
-        tracker = tmp_path / "logs/exp_tracking/rank0/tracker.jsonl"
-        tracker.parent.mkdir(parents=True)
-        rows = [{
-            "step": index + 1, "lr": index * 8e-4 / 2000, "grad_norm": 2.0, "time/step_time": 1.0,
-            "loss/reduced_total_loss": 8.0, "loss/reduced_lm_loss": 5.0,
-            "loss/reduced_vq_token_loss": 1.0, "loss/reduced_hlm_token_loss": 2.0,
-            "loss/valid_targets": 128 * 8192,
-        } for index in range(2)]
-        tracker.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        ENTRY.collect_metrics(tmp_path)
-        result = [json.loads(row) for row in (tmp_path / "train_metrics.jsonl").read_text().splitlines()]
-        assert [row["lr"] for row in result] == [row["lr"] for row in rows]
-        assert [row["step"] for row in result] == [0, 1]
-        assert result[0]["tokens_per_second_per_gpu"] == 128 * 8192 / 8
-        assert result[0]["total_loss"] == 8
-        assert (tmp_path / "native_training_complete.json").exists()
-
-    def test_incomplete_export_does_not_certify_completion(self, tmp_path: Path) -> None:
-        (tmp_path / "training_config.json").write_text(json.dumps({"steps": 2}))
-        tracker = tmp_path / "logs/exp_tracking/rank0/tracker.jsonl"
-        tracker.parent.mkdir(parents=True)
-        tracker.write_text('{"step": 1}\n')
-        with pytest.raises(ValueError, match="incomplete"):
-            ENTRY.collect_metrics(tmp_path)
-        assert not (tmp_path / "native_training_complete.json").exists()
-
-    def test_observer_only_adds_metrics(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(OBSERVER.dist, "all_reduce", lambda value: None)
-        observer = OBSERVER.ConceptLMTrainingObserver()
-        observer.sp_size = 8
-        stats = {"concept_vq_loss": torch.tensor([0.5, 0.5]),
-                 "concept_hlm_loss": torch.tensor([1.0, 1.0]),
-                 "concept_valid_targets": torch.tensor([32, 32])}
-        info = {"extra_info": stats, "logs_info": {"reduced_llm_loss": 8.0}}
-        before = {key: value.clone() for key, value in stats.items()}
-        observer(info, 0, 1, 2, None)
-        assert info["logs_info"]["reduced_lm_loss"] == 5.0
-        assert info["logs_info"]["valid_targets"] == 8
-        for key in stats:
-            torch.testing.assert_close(stats[key], before[key], rtol=0, atol=0)
 
     @pytest.mark.parametrize("style", ["wsd", "cosine"])
     def test_real_trainer_fit_uses_lr_before_advancing(self, style: str) -> None:
@@ -192,7 +189,6 @@ class TestQwen35TrainerEntry:
 class TestConceptLMNativeContext:
     def test_cpu_labels_follow_sequence_device(self) -> None:
         # Load the real loss classes while omitting package initializers only.
-        from _cpu_source_loader import load_ast
         base = load_ast("xtuner/v1/loss/base_loss_ctx.py", {"Parameter": lambda **kwargs: None}, ("cyclopts",))
         loss = load_ast("xtuner/v1/loss/conceptlm_loss.py", base, (
             "base_loss_ctx", "xtuner.v1.module.concept_quantizer", "xtuner.v1.module.concept_sequence",

@@ -12,8 +12,29 @@ def env_on(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+@torch.library.custom_op("xtuner::low_precision_rms_weight", mutates_args=())
+def _low_precision_rms_weight(weight: Tensor) -> Tensor:
+    # An explicit boundary preserves BF16/FP16 addition rounding when the
+    # effective scale is subsequently promoted for cached source multiplication.
+    return weight + 1.0
+
+
+@_low_precision_rms_weight.register_fake
+def _low_precision_rms_weight_fake(weight: Tensor) -> Tensor:
+    return torch.empty_like(weight)
+
+
+def _low_precision_rms_weight_backward(ctx, grad: Tensor) -> Tensor:
+    return grad
+
+
+_low_precision_rms_weight.register_autograd(_low_precision_rms_weight_backward)
+
+
 def effective_weight(weight: Tensor) -> Tensor:
     """Convert a zero-centered gamma to its effective scale."""
+    if torch.compiler.is_compiling() and weight.dtype in (torch.float16, torch.bfloat16):
+        return _low_precision_rms_weight(weight)
     return weight + 1.0
 
 

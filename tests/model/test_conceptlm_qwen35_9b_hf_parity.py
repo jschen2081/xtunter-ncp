@@ -21,6 +21,9 @@ NCP_QWEN35_V2_PATH = os.environ.get("NCP_QWEN35_V2_PATH")
 def _controlled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     values = {
         "XTUNER_HF_IMPL": "true",
+        "XTUNER_GDN_CUSTOM_OP": "false",
+        "XTUNER_GDN_FUSED_QK_L2": "false",
+        "XTUNER_GDN_FUSED_NORM_GATE": "false",
         "NCP_Q35V2_TORCH_RMS": "1",
         "NCP_Q35V2_MUDD_RMS": "1",
         "NCP_Q35V2_TE_RMS": "0",
