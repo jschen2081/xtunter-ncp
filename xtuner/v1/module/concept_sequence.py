@@ -36,6 +36,22 @@ def document_lengths(seq_ctx: SequenceContext) -> list[int]:
     return [int(length) for length in lengths.detach().cpu().tolist()]
 
 
+def padded_document_lengths(lengths: list[int], chunk_size: int, sp_size: int = 1) -> list[int]:
+    """Document lengths after concept-stream padding.
+
+    Every document grows to at least two chunks and a chunk multiple so each
+    document yields at least one concept-successor pair. Under sequence
+    parallelism the final document additionally absorbs the tail padding that
+    aligns the total to ``sp_size * chunk_size`` per shard.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    padded = [max(2 * chunk_size, -(-length // chunk_size) * chunk_size) for length in lengths]
+    if sp_size > 1 and padded:
+        padded[-1] += (-sum(padded)) % (sp_size * chunk_size)
+    return padded
+
+
 def merge_chunks(
     hidden_states: Tensor,
     doc_lengths: list[int],

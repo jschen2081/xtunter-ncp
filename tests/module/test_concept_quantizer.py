@@ -1,7 +1,7 @@
 """ConceptLM 残差 VQ 量化器（``ConceptQuantizer``）回归测试。
 
 量化器是 ConceptLM 配方里唯一不做前后向近似的新模块，参考实现
-（``megatron/core/models/conceptlm/quantizer.py``）的语义必须逐条保住：
+（NCP Qwen3.5 ConceptLM quantizer）的语义必须逐条保住：
 
 TestConceptQuantizerForward
     test_code_ids_match_brute_force: 逐头最近邻码字与暴力解一致。

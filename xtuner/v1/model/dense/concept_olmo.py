@@ -686,8 +686,9 @@ class ConceptLMV22VQ(BaseModel):
 
         ``concept_vq_hidden`` is the full ``concept_vq_input_norm`` output.
         ``predicted_concepts[i]`` predicts the next concept, so the last
-        concept of every packed document has no HLM target. Megatron detaches
-        the quantizer input, so commitment does not train the encoder.
+        concept of every packed document has no HLM target. The reference
+        implementation detaches the quantizer input, so commitment does not
+        train the encoder.
         """
         zero = concept_vq_hidden.new_zeros(())
         ncp_parts: list[torch.Tensor] = []
@@ -861,7 +862,7 @@ class ConceptLMV22VQ(BaseModel):
         concept_hidden, concept_lengths = self._merge_chunks(full_encoder_hidden, token_lengths)
         valid_concept_length = concept_hidden.shape[1]
         active_concept_lengths = [length for length in concept_lengths if length > 0]
-        # Megatron norms the merged concepts before VQ and the HLM target.
+        # The recipe norms the merged concepts before VQ and the HLM target.
         # LayerNorm is per token, so doing it before the SP split matches the
         # full-sequence norm used by those losses.
         concept_hidden = self.concept_vq_input_norm(concept_hidden)

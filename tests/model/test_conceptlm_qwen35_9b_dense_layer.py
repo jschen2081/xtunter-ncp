@@ -116,9 +116,12 @@ def _manual_dense_forward(
 
 
 class TestConceptLMQwen35V2DenseLayer:
-    @pytest.mark.parametrize("megatron_compatible", [False, True])
-    def test_conv_weights_follow_megatron_adamw_routing(
-        self, config: _TinyV2Config, monkeypatch: pytest.MonkeyPatch, megatron_compatible: bool,
+    @pytest.mark.parametrize("concept_muon", [False, True])
+    def test_conv_weights_follow_semantic_adamw_routing(
+        self,
+        config: _TinyV2Config,
+        monkeypatch: pytest.MonkeyPatch,
+        concept_muon: bool,
     ) -> None:
         from xtuner.v1.config.optim import MuonConfig
 
@@ -133,12 +136,37 @@ class TestConceptLMQwen35V2DenseLayer:
 
         # Parameter grouping is CPU-only and does not need a process group.
         monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-        optimizer = MuonConfig(megatron_compatible=megatron_compatible, weight_decay=0.03).build(model)
+        optimizer = MuonConfig(concept_muon=concept_muon, weight_decay=0.03).build(model)
         groups = {id(param): group for group in optimizer.param_groups for param in group["params"]}
         for param in conv_weights.values():
             group = groups[id(param)]
-            assert group["algorithm"] == ("adamw" if megatron_compatible else "muon")
-            assert group["weight_decay"] == (0.1 if megatron_compatible else 0.03)
+            assert group["algorithm"] == ("adamw" if concept_muon else "muon")
+            assert group["weight_decay"] == (0.1 if concept_muon else 0.03)
+
+    @pytest.mark.parametrize("concept_muon", [False, True])
+    def test_codebooks_follow_muon_routing(
+        self,
+        config: _TinyV2Config,
+        monkeypatch: pytest.MonkeyPatch,
+        concept_muon: bool,
+    ) -> None:
+        from xtuner.v1.config.optim import MuonConfig
+
+        model = config.build()
+        codebooks = {name: param for name, param in model.named_parameters() if name.startswith("codebooks.")}
+        assert len(codebooks) == 4
+        metadata = model.get_muon_metadata()
+        for param in codebooks.values():
+            assert param not in metadata["param_options"]
+
+        # Parameter grouping is CPU-only and does not need a process group.
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        optimizer = MuonConfig(concept_muon=concept_muon, weight_decay=0.03).build(model)
+        groups = {id(param): group for group in optimizer.param_groups for param in group["params"]}
+        for param in codebooks.values():
+            group = groups[id(param)]
+            assert group["algorithm"] == "muon"
+            assert group["weight_decay"] == 0.03
 
     @pytest.mark.parametrize("layer_index", [0, 3])
     def test_dense_forward_preserves_v2_operation_order(self, config: _TinyV2Config, layer_index: int):

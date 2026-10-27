@@ -17,6 +17,7 @@ layout. The inherited 9B ``attention`` MHA spec is unused.
 
 import math
 from itertools import accumulate
+from pathlib import Path
 from typing import Literal, Self, cast
 
 import torch
@@ -41,7 +42,7 @@ from xtuner.v1.module.attention.concept_qwen35 import (
     NCPQwen35V2GatedDeltaNetConfig,
     NCPQwen35V2MLAConfig,
 )
-from xtuner.v1.module.concept_sequence import document_lengths, expand_concepts, merge_chunks
+from xtuner.v1.module.concept_sequence import document_lengths, expand_concepts, merge_chunks, padded_document_lengths
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.fused_swiglu import FusedSwiGLUMLP
 from xtuner.v1.module.linear import build_linear
@@ -91,11 +92,8 @@ def _arange_positions(lengths: list[int], device: torch.device) -> Tensor:
 
 
 def _hf_padded_lengths(lengths: list[int], chunk_size: int) -> list[int]:
-    """HF pads each sequence to at least two chunks and a chunk multiple."""
-    padded: list[int] = []
-    for length in lengths:
-        padded.append(max(2 * chunk_size, math.ceil(length / chunk_size) * chunk_size))
-    return padded
+    """Pad each document to at least two chunks and a chunk multiple."""
+    return padded_document_lengths(lengths, chunk_size)
 
 
 def _context_from_lengths(
@@ -422,9 +420,7 @@ class ConceptLMQwen35V2Stack(nn.Module):
             raise RuntimeError("Dual Cross-MUDD is inference-only; use eval() and disable autograd")
         # Scope the cache to this invocation so weights/inputs cannot go stale
         # across micro-batches, optimizer updates, or checkpoint recomputation.
-        use_source_cache = (
-            self.cache_cross_source_rms and _env_on("NCP_Q35V2_MUDD_RMS", "1") and not use_dual_kernel
-        )
+        use_source_cache = self.cache_cross_source_rms and _env_on("NCP_Q35V2_MUDD_RMS", "1") and not use_dual_kernel
         source_units: tuple[tuple[Tensor, ...], ...] = ()
         if use_source_cache:
             source_units = tuple(
@@ -553,6 +549,11 @@ class ConceptLMQwen35V2Config(Qwen3_5_VLTextDense9BConfig):
             raise ValueError("MLA positional head dim must be even")
         if self.concept_loss_cfg is not None and self.concept_loss_cfg.concept_chunk_size != self.concept_chunk_size:
             raise ValueError("ConceptLM loss and model chunk sizes must agree")
+        if self.concept_loss_cfg is None:
+            log_rank0.warning(
+                "concept_loss_cfg is None: the concept VQ/HLM auxiliary losses are disabled and only the "
+                "token cross-entropy is optimized. Set concept_loss_cfg for concept-model training."
+            )
         return self
 
     def build(self) -> "ConceptLMQwen35V2":  # type: ignore[override]
@@ -630,6 +631,22 @@ class ConceptLMQwen35V2(BaseModel):
         if name == "fusion_alpha" and loaded_tensor.ndim == 0:
             return loaded_tensor.reshape(1)
         return loaded_tensor
+
+    @override
+    def from_hf(self, hf_path: str | Path, strict: bool = True) -> tuple:
+        loaded_keys, unloaded_keys, missing_keys = super().from_hf(hf_path, strict)
+        # Codebooks are zero-initialized at construction: a checkpoint that lacks
+        # them leaves every concept embedding degenerate instead of merely
+        # undertrained, so even a non-strict load must not skip them silently.
+        skipped_codebooks = {key for key in unloaded_keys if key.startswith("codebooks.")}
+        if skipped_codebooks:
+            raise RuntimeError(
+                f"Checkpoint {hf_path} does not contain concept codebook weights "
+                f"({len(skipped_codebooks)} codebooks unloaded); the zero-initialized codebooks "
+                "would collapse every concept embedding to zero. Load a checkpoint with "
+                "model.codebooks.* entries or initialize the model from scratch instead."
+            )
+        return loaded_keys, unloaded_keys, missing_keys
 
     def param_to_safetensor(self, safetensor: Tensor, hf_param_name: str) -> Tensor:
         if hf_param_name == "model.fusion_alpha" and safetensor.shape == (1,):
@@ -750,7 +767,7 @@ class ConceptLMQwen35V2(BaseModel):
                 scalar[param] = 0.0
             elif name.endswith(".self_attn.conv1d.weight") or name == "fusion_alpha":
                 # Match torch module names; HF export renames self_attn to attention.
-                # Megatron fusion_alpha is 0D (weight decay enabled), xTuner is [1].
+                # Depthwise conv1d and fusion_alpha update element-wise with decay 0.1.
                 scalar[param] = 0.1
         for module in self.modules():
             kind = type(module).__name__

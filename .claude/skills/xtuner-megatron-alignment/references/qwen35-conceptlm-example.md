@@ -21,7 +21,7 @@ L = [CE_num + 4*(VQ_num + HLM_num)] / T
 
 ## Muon 参数更新
 
-本会话 opt-in MuonConfig(megatron_compatible=True)，默认 False 保留普通实现。
+本会话 opt-in MuonConfig(concept_muon=True)，默认 False 保留普通实现。
 
 | 项目 | Recipe |
 |---|---|
@@ -42,7 +42,7 @@ L = [CE_num + 4*(VQ_num + HLM_num)] / T
 - 路由二维 norm/static coefficients 走 Adam/no-WD；conv 的3D/2D、fusion scalar/[1]布局差异不应改变算法或 decay。
 - 若主更新已经对整个 fused 参数 decay，Adam 尾部不能再次 decay。
 
-专用 MegatronMuon 复用原 DTensor 通信/分片能力和标准 AdamW，隔离 EMA/NS。不要改普通 Muon 的动量、bias correction 或默认 NS 算式来迁就特定模型。fresh optimizer 测试不证明跨拓扑 checkpoint state 迁移正确。
+专用 ConceptMuon 复用原 DTensor 通信/分片能力和标准 AdamW，隔离 EMA/NS。不要改普通 Muon 的动量、bias correction 或默认 NS 算式来迁就特定模型。fresh optimizer 测试不证明跨拓扑 checkpoint state 迁移正确。
 
 ## SP 归一化
 
@@ -112,8 +112,9 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 | training_environment.py | 启动环境快照校验与FLA运行时版本检查；默认值由启动sh提供 |
 | compare_results.py | completion、step/micro、targets、指纹、LR和误差报告 |
 | train_qwen35.py / replay_xtuner.py | 独立训练配置与单文件回放入口；回放文件包含batch契约、数据读取和原生Trainer适配，SP组内按(micro,原rank)顺序读取相同完整输入，交由Trainer切分 |
+| qwen35_training_observer.py | 正式训练的观测钩子：把 concept VQ/HLM 与 valid targets 从 extra_info 汇总进日志 |
+| align_conceptlm_qwen35_v2_hf.py | 与HF参考实现的 logit 对齐，单节点8卡 |
 | ../run_qwen35_v2_9b_8gpu.sh | 独立八卡入口，默认SP1，SP_SIZE=8或--sp-size 8 |
-| probe_xtuner_gradients.py / locate_xtuner_gradients.py / gradient_probe_utils.py / layer_gradient_trace.py / compare_gradient_location.py | 诊断工具，与正式训练分离 |
 
 正式能力：
 
@@ -124,8 +125,6 @@ Megatron 复用 examples/conceptlm/lm_zloss.py；xTuner 放正式 CE/loss contex
 - xtuner/v1/module/concept_quantizer.py / concept_sequence.py：共享量化和HLM序列能力。
 - xtuner/v1/config/optim.py、xtuner/v1/optim/concept_qwen35_muon.py / muon.py：opt-in适配、共享通信和原有默认实现。
 - examples/v1/scripts/qwen35_9b_alignment/align_conceptlm_qwen35_v2_sp_training.py：原SP测试；随机数据、AdamW/CE默认配置不等于生产对比recipe。
-
-run_gradient_*、wait_then_run_nosync.sh、run_qwen35_controlled.sh可能等待GPU、绑定固定路径；先读代码，存在不等于获准执行。
 
 tests/utils/test_qwen35_trainer_entry.py 内联的 load_ast 仅用于 CPU loss context 设备检查，跳过指定导入，不替换数值实现，不在正式训练或回放依赖链中。
 

@@ -43,7 +43,7 @@ class WarmupDecayLR(LRScheduler):
         """Compute absolute LRs for the next update from completed updates.
 
         Returns:
-            list[float]: Per-group LRs using the same arithmetic as Megatron.
+            list[float]: Per-group LRs for the next update.
         """
         step = self.last_epoch
         if self.warmup > 0 and step <= self.warmup:
@@ -67,7 +67,7 @@ def build_lr_scheduler(optimizer: Optimizer, config: "LRConfig", total_steps: in
     update.
 
     Explicit step counts use completed optimizer updates, rather than microsteps.
-    With fixed GBS this is equivalent to Megatron's sample-count schedule. The
+    With fixed GBS this is equivalent to a sample-count schedule. The
     caller advances the scheduler after each update; resume restores its state.
     Existing recipes without explicit counts retain their legacy schedulers.
 

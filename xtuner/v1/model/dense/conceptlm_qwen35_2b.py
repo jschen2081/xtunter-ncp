@@ -1,9 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Qwen3.5 ConceptLM: encoder / predictor / decoder composition with MUDD.
 
-Port of the reference implementation (``megatron_ncp_qwen35`` @
-``jxxiong/residual``, ``examples/conceptlm``) onto XTuner's Qwen3.5 dense
-tower:
+Port of the NCP Qwen3.5 ConceptLM reference implementation onto XTuner's
+Qwen3.5 dense tower:
 
     tokens -> encoder stack (optional MUDD)
            -> chunk-4 mean-pooled concepts

@@ -230,17 +230,18 @@ class SequenceContext:
                     torch.LongTensor,
                     split_for_sequence_parallel(pad_position_ids, dim=-1, sp_mesh=sequence_parallel_mesh),
                 )
-                self.position_ids = position_ids
+            else:
+                position_ids = None
 
-            if self.rollout_routed_experts is not None:
-                assert isinstance(self.rollout_routed_experts, torch.Tensor), (
-                    f"rollout_routed_experts must be a tensor, but got {type(self.rollout_routed_experts)}"
+            rollout_routed_experts = self.rollout_routed_experts
+            if rollout_routed_experts is not None:
+                assert isinstance(rollout_routed_experts, torch.Tensor), (
+                    f"rollout_routed_experts must be a tensor, but got {type(rollout_routed_experts)}"
                 )
-                pad_rollout_routed_experts = pad_to_multiple_of(self.rollout_routed_experts, 0, multiple_of, 0)
+                pad_rollout_routed_experts = pad_to_multiple_of(rollout_routed_experts, 0, multiple_of, 0)
                 rollout_routed_experts = split_for_sequence_parallel(
                     pad_rollout_routed_experts, dim=0, sp_mesh=sequence_parallel_mesh
                 )
-                self.rollout_routed_experts = rollout_routed_experts
 
             sp_seq_ctx = self.__class__(
                 input_ids=sp_input_ids,
@@ -249,7 +250,7 @@ class SequenceContext:
                 max_length_q=new_max_length,
                 max_length_k=new_max_length,
                 num_padding=sp_num_padding,
-                position_ids=self.position_ids,
+                position_ids=position_ids,
                 block_table=self.block_table,
                 device=sp_input_ids.device,
                 sequence_parallel_mesh=sequence_parallel_mesh,
@@ -258,7 +259,7 @@ class SequenceContext:
                 image_grid_thw=self.image_grid_thw,
                 inputs_embeds=self.inputs_embeds,
                 num_img_tokens=self.num_img_tokens,
-                rollout_routed_experts=self.rollout_routed_experts,
+                rollout_routed_experts=rollout_routed_experts,
                 offload_rollout_routed_experts=self.offload_rollout_routed_experts,
                 raw_input_ids=cast(torch.LongTensor, pad_input_ids),
                 shard_start=start,

@@ -35,8 +35,13 @@ def scale_source(x: Tensor, scale: Tensor) -> Tensor:
 
 @triton.jit
 def _partial_weight_gradient(
-    source, grad, partial, rows: tl.constexpr, width: tl.constexpr,
-    ROWS: tl.constexpr, COLS: tl.constexpr,
+    source,
+    grad,
+    partial,
+    rows: tl.constexpr,
+    width: tl.constexpr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
 ):
     r = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     c = tl.program_id(1) * COLS + tl.arange(0, COLS)

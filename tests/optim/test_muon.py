@@ -12,6 +12,7 @@
 
 import copy
 import math
+import os
 from typing import Callable, Literal, overload
 
 import parametrize
@@ -130,7 +131,9 @@ def test_qkv_split_gathers_before_orthogonalize():
     assert seen == [(gathered_rows, hidden)] * 3
     scale = math.sqrt(max(gathered_rows, hidden))
     grouped = source.view(groups, 3 * head_dim, hidden)
-    parts = [part.reshape(gathered_rows, hidden) * scale for part in grouped.split((head_dim, head_dim, head_dim), dim=1)]
+    parts = [
+        part.reshape(gathered_rows, hidden) * scale for part in grouped.split((head_dim, head_dim, head_dim), dim=1)
+    ]
     expected = torch.cat([part.view(groups, head_dim, hidden) for part in parts], dim=1).reshape(rows, hidden)
     torch.testing.assert_close(result, expected)
 
@@ -542,6 +545,222 @@ class TestMuonSingleGPU(DeterministicDDPTestCase):
 
         optimizer.add_param_group({"params": [nn.Parameter(torch.empty(4, 4))]})
         assert optimizer.param_groups[-1]["clip_grad"] is False
+
+
+# ─── Test: ConceptMuon gate-state checkpointing ─────────────────────────────
+
+
+def test_gate_adamw_state_survives_checkpoint():
+    """Gate AdamW rows keep parameter-shaped m/v state that round-trips through
+    state_dict without changing subsequent updates.
+
+    Regression test: gate states were previously sized to the local gate-row
+    slice and created only on ranks holding those rows, so distributed
+    checkpoints dropped or misaligned them.
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    from xtuner.v1.optim.concept_qwen35_muon import ConceptMuon
+
+    initialized_here = False
+    if not dist.is_initialized():
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29571")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        initialized_here = True
+
+    try:
+        mesh = DeviceMesh("cpu", [0])
+        torch.manual_seed(0)
+        # BF16 parameters exercise the FP32 optimizer-state path.
+        init = torch.randn(8, 4).to(torch.bfloat16)
+        grad = torch.randn(8, 4).to(torch.bfloat16)
+
+        def make_param() -> nn.Parameter:
+            return nn.Parameter(distribute_tensor(init.clone(), mesh, placements=[Shard(0)]))
+
+        def make_optimizer(param: nn.Parameter) -> ConceptMuon:
+            return ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+
+        def step(optimizer: ConceptMuon, param: nn.Parameter) -> None:
+            param.grad = distribute_tensor(grad.clone(), mesh, placements=[Shard(0)])
+            optimizer.step()
+
+        # Uninterrupted reference: three steps.
+        ref_param = make_param()
+        ref_optimizer = make_optimizer(ref_param)
+        for _ in range(3):
+            step(ref_optimizer, ref_param)
+
+        # Interrupted run: two steps, checkpoint, restore into a fresh optimizer.
+        param = make_param()
+        optimizer = make_optimizer(param)
+        for _ in range(2):
+            step(optimizer, param)
+
+        state_dict = optimizer.state_dict()
+        state = next(iter(state_dict["state"].values()))
+        # States follow the fused parameter's sharding, not the gate-row slice,
+        # and optimizer state stays FP32 while parameters may be low-precision.
+        assert state["gate_momentum"].shape == param.shape
+        assert state["gate_momentum"].dtype == torch.float32
+        assert state["gate_variance"].shape == param.shape
+        assert state["gate_variance"].dtype == torch.float32
+        assert state["momentum"].dtype == torch.float32
+        assert state["gate_step"] == 2
+
+        restored = make_optimizer(param)
+        restored.load_state_dict(state_dict)
+        step(restored, param)
+
+        ref_state = ref_optimizer.state[ref_param]
+        restored_state = restored.state[param]
+        torch.testing.assert_close(param.to_local(), ref_param.to_local(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            restored_state["momentum"].to_local(), ref_state["momentum"].to_local(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            restored_state["gate_momentum"].to_local(),
+            ref_state["gate_momentum"].to_local(),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            restored_state["gate_variance"].to_local(),
+            ref_state["gate_variance"].to_local(),
+            atol=0,
+            rtol=0,
+        )
+        assert restored_state["gate_step"] == ref_state["gate_step"] == 3
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
+def test_load_state_dict_rejects_unsharded_state_for_sharded_param():
+    """A full (unsharded) checkpoint tensor for a sharded FP32 state must raise
+    instead of being silently treated as the local shard."""
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    from xtuner.v1.optim.concept_qwen35_muon import ConceptMuon
+
+    initialized_here = False
+    if not dist.is_initialized():
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29572")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        initialized_here = True
+
+    try:
+        mesh = DeviceMesh("cpu", [0])
+        torch.manual_seed(0)
+        param = nn.Parameter(distribute_tensor(torch.randn(8, 4).to(torch.bfloat16), mesh, placements=[Shard(0)]))
+        optimizer = ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+        param.grad = distribute_tensor(torch.randn(8, 4).to(torch.bfloat16), mesh, placements=[Shard(0)])
+        optimizer.step()
+
+        state_dict = optimizer.state_dict()
+        state = next(iter(state_dict["state"].values()))
+        # Simulate a checkpoint that stored the full tensor instead of the shard.
+        state["gate_momentum"] = state["gate_momentum"].to_local().clone()
+
+        restored = ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+        try:
+            restored.load_state_dict(state_dict)
+        except ValueError as error:
+            assert "cross-topology" in str(error)
+        else:
+            raise AssertionError("load_state_dict accepted an unsharded tensor for a sharded state")
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
+def test_load_state_dict_rejects_legacy_gate_keys():
+    """Legacy MegatronMuon production_gate_* state must be rejected loudly
+    instead of being silently reinitialized on the next step."""
+    from xtuner.v1.optim.concept_qwen35_muon import ConceptMuon
+
+    torch.manual_seed(0)
+    param = nn.Parameter(torch.randn(8, 4).to(torch.bfloat16))
+    optimizer = ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+
+    state_dict = optimizer.state_dict()
+    entry = next(iter(state_dict["state"].values()))
+    entry["production_gate_m"] = torch.zeros(2, 4)
+    entry["production_gate_step"] = 5
+
+    restored = ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+    try:
+        restored.load_state_dict(state_dict)
+    except ValueError as error:
+        assert "legacy" in str(error)
+    else:
+        raise AssertionError("load_state_dict accepted legacy production_gate_* state")
+
+
+def test_load_state_dict_promotes_low_precision_momentum():
+    """A BF16 checkpoint momentum under optim_state_dtype=float32 is promoted
+    to FP32 instead of being silently kept in BF16."""
+    from xtuner.v1.optim.concept_qwen35_muon import ConceptMuon
+
+    torch.manual_seed(0)
+    param = nn.Parameter(torch.randn(8, 4).to(torch.bfloat16))
+    optimizer = ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+    legacy_momentum = torch.randn(8, 4).to(torch.bfloat16)
+    optimizer.state[param]["momentum"] = legacy_momentum.clone()
+
+    state_dict = optimizer.state_dict()
+    restored = ConceptMuon([param], muon_split_sizes={param: (6,)}, muon_adamw_ranges={param: (6, 8)})
+    restored.load_state_dict(state_dict)
+
+    promoted = restored.state[param]["momentum"]
+    assert promoted.dtype == torch.float32
+    torch.testing.assert_close(promoted, legacy_momentum.float(), atol=0, rtol=0)
+
+
+def _uneven_shard_restore_worker(rank: int, world_size: int) -> None:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    from xtuner.v1.optim.concept_qwen35_muon import ConceptMuon
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29573"
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    try:
+        mesh = DeviceMesh("cpu", list(range(world_size)))
+        torch.manual_seed(0)
+        # 7 rows over 2 ranks shard unevenly to (4, 4) and (3, 4).
+        param = nn.Parameter(distribute_tensor(torch.randn(7, 4).to(torch.bfloat16), mesh, placements=[Shard(0)]))
+        optimizer = ConceptMuon([param], muon_split_sizes={param: (5,)}, muon_adamw_ranges={param: (5, 7)})
+        state = optimizer.state[param]
+        for name in ("momentum", "gate_momentum", "gate_variance"):
+            state[name] = torch.zeros_like(param, dtype=torch.float32)
+
+        state_dict = optimizer.state_dict()
+        restored = ConceptMuon([param], muon_split_sizes={param: (5,)}, muon_adamw_ranges={param: (5, 7)})
+        restored.load_state_dict(state_dict)
+
+        for name in ("momentum", "gate_momentum", "gate_variance"):
+            restored_state = restored.state[param][name]
+            # from_local must keep the true global shape, not local_rows*world_size.
+            assert tuple(restored_state.shape) == (7, 4), (name, tuple(restored_state.shape))
+            assert restored_state.to_local().shape == param.to_local().shape
+    finally:
+        dist.destroy_process_group()
+
+
+def test_load_state_dict_preserves_global_shape_on_uneven_shards():
+    """Restoring FP32 state on unevenly sharded parameters keeps the true
+    global shape instead of local_rows*world_size."""
+    torch.multiprocessing.spawn(_uneven_shard_restore_worker, args=(2,), nprocs=2, join=True)
 
 
 # ─── Test: end-to-end FSDP ───────────────────────────────────────────────────

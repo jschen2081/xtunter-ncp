@@ -81,5 +81,3 @@ class _NativeBackwardRMSNorm(torch.autograd.Function):
             grad_out, x, rstd, weight, ctx.needs_input_grad[0], weight is not None and ctx.needs_input_grad[1]
         )
         return dx, dw, None
-
-

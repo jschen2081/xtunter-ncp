@@ -263,8 +263,13 @@ class LMHeadLossContext(BaseLossContext):
             # Subclasses with another loss_fn retain the original callable contract.
             accumulate_forward = loss_forward if type(self).loss_fn is LMHeadLossContext.loss_fn else None
             loss, extra_info = ChunkLoss.apply(
-                hidden_states, head_weight, head_bias, loss_forward, chunks,
-                self.loss_cfg.chunk_size, accumulate_forward,
+                hidden_states,
+                head_weight,
+                head_bias,
+                loss_forward,
+                chunks,
+                self.loss_cfg.chunk_size,
+                accumulate_forward,
             )
             return loss, (None, extra_info)
         else:

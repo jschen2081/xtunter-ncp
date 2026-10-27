@@ -2,8 +2,6 @@
 
 from typing import TYPE_CHECKING
 
-import torch
-import torch.distributed as dist
 
 if TYPE_CHECKING:
     from xtuner.v1.engine.train_engine import TrainStepInfo
@@ -19,10 +17,13 @@ class ConceptLMTrainingObserver:
         Args:
             trainer (Trainer): Native trainer owning the model and optimizer.
         """
-        self.sp_size = trainer.sp_mesh.size()
         engine = trainer._engine
-        muon_ids = {id(param) for group in engine.optimizer.param_groups
-                    if group.get("algorithm") == "muon" for param in group["params"]}
+        muon_ids = {
+            id(param)
+            for group in engine.optimizer.param_groups
+            if group.get("algorithm") == "muon"
+            for param in group["params"]
+        }
         if not all(id(param) in muon_ids for param in engine.model.codebooks):
             raise ValueError("This alignment recipe requires Muon for all codebooks")
 
@@ -40,15 +41,16 @@ class ConceptLMTrainingObserver:
             total_epoch (int | None): Optional epoch limit.
         """
         extra = train_step_info["extra_info"]
-        stats = torch.stack([extra[key].detach().sum() for key in (
-            "concept_vq_loss", "concept_hlm_loss", "concept_valid_targets",
-        )])
-        dist.all_reduce(stats)
-        vq, hlm, replicated_targets = stats.tolist()
+        # ConceptLM metrics are already globally reduced per microbatch (targets are
+        # SP-normalized); summing over local microbatches yields step totals.
+        vq, hlm, targets = (
+            extra[key].detach().sum().item()
+            for key in ("concept_vq_loss", "concept_hlm_loss", "concept_valid_targets")
+        )
         logs = train_step_info["logs_info"]
         total = logs["reduced_llm_loss"]  # The model's loss already includes the auxiliary objectives.
         logs.update(
             reduced_total_loss=total, reduced_lm_loss=total - vq - hlm,
             reduced_vq_token_loss=vq, reduced_hlm_token_loss=hlm,
         )
-        logs["valid_targets"] = replicated_targets / self.sp_size
+        logs["valid_targets"] = targets

@@ -200,7 +200,7 @@ class RopeParametersConfig(BaseModel):
         hf_rope_parameters = getattr(hf_config, "rope_parameters", None)
         hf_rope_scaling = getattr(hf_config, "rope_scaling", None)
         # Some remote-code checkpoints (for example ConceptLM/OLMo-derived
-        # models) still expose Megatron's ``rotary_base`` name instead of the
+        # models) still expose the legacy ``rotary_base`` name instead of the
         # HuggingFace ``rope_theta`` name. Keep all compatibility handling in
         # this shared parser so model configs do not parse RoPE ad hoc.
         hf_rope_theta = getattr(hf_config, "rope_theta", None)

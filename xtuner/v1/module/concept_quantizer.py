@@ -1,8 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Product-vector quantizer for the ConceptLM concept stream.
 
-Port of ``megatron/core/models/conceptlm/quantizer.py`` from the reference
-implementation (``jxxiong/residual`` of ``megatron_ncp_qwen35``) so the XTuner
+Ported from the NCP Qwen3.5 ConceptLM reference implementation so the XTuner
 ConceptLM recipe keeps the same concept quantisation contract:
 
 * the hidden vector is split into ``num_codebooks`` heads of ``hidden / num_codebooks``;

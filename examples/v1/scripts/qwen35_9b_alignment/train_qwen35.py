@@ -103,7 +103,7 @@ def build_trainer_config(
         ),
         loss_cfg=lm_loss,
         optim_cfg=MuonConfig(
-            megatron_compatible=True,
+            concept_muon=True,
             lr=config["lr"],
             betas=(0.9, 0.95),
             eps=1e-8,

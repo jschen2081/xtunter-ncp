@@ -73,4 +73,4 @@ SP/CP对齐步骤：
 
 ## 特定模型适配
 
-Qwen3.5-9B ConceptLM的VQ/HLM、MegatronMuon矩阵切分、SP副本校准和可选LM z-loss方案见 [qwen35-conceptlm-example.md](qwen35-conceptlm-example.md)。仅作为具体案例，不将其loss权重、八卡拓扑或更新参数推广到其他模型。
+Qwen3.5-9B ConceptLM的VQ/HLM、ConceptMuon矩阵切分、SP副本校准和可选LM z-loss方案见 [qwen35-conceptlm-example.md](qwen35-conceptlm-example.md)。仅作为具体案例，不将其loss权重、八卡拓扑或更新参数推广到其他模型。

@@ -38,7 +38,10 @@ class ChunkLoss(torch.autograd.Function):
 
         ctx.num_inputs = len(ctx.needs_input_grad)
         accumulate_enabled = os.environ.get("XTUNER_CHUNK_GRAD_ACCUMULATION", "false").strip().lower() in {
-            "1", "true", "yes", "on"
+            "1",
+            "true",
+            "yes",
+            "on",
         }
         device = hidden_states.device
         accumulated_loss = torch.zeros((), device=device)
@@ -73,7 +76,10 @@ class ChunkLoss(torch.autograd.Function):
                 if can_accumulate:
                     assert loss_forward_accumulate is not None
                     chunk_loss, (_, extra_info) = loss_forward_accumulate(
-                        hidden_states_chunk, head_weight, None, loss_kwargs_chunks[i],
+                        hidden_states_chunk,
+                        head_weight,
+                        None,
+                        loss_kwargs_chunks[i],
                         grad_weight_buffer=grad_weight,
                     )
                 else:

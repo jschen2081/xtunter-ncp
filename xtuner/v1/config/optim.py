@@ -5,10 +5,10 @@ from typing import Literal, Optional, Tuple
 import torch
 import torch.distributed as dist
 from cyclopts import Parameter
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from typing_extensions import Annotated
 
-from xtuner.v1.optim import LocalDTensorAdamW, MegatronMuon, Muon, SwapAdamW
+from xtuner.v1.optim import ConceptMuon, LocalDTensorAdamW, Muon, SwapAdamW
 from xtuner.v1.utils import get_logger
 
 
@@ -141,8 +141,12 @@ class AdamWConfig(OptimConfig):
 
 
 class MuonConfig(OptimConfig):
-    megatron_compatible: Annotated[
-        bool, Parameter(help="Use Megatron EMA, quintic NS and model-owned semantic projection layouts")
+    concept_muon: Annotated[
+        bool,
+        Parameter(
+            help="Use EMA momentum, quintic Newton-Schulz and model-owned projection split "
+            "layouts (ConceptMuon); FP32 optimizer state is kept while parameters stay low-precision"
+        ),
     ] = False
     weight_decay: Annotated[float, Parameter(help="Weight decay coefficient for L2 regularization")] = 0.1
     momentum: Annotated[float, Parameter(help="Momentum coefficients for Muon optimizer")] = 0.95
@@ -153,7 +157,7 @@ class MuonConfig(OptimConfig):
     ] = "rms_norm"
     extra_scale_factor: Annotated[
         float,
-        Parameter(help="Multiplier for rms_norm: scale * sqrt(max(rows, cols)); 0.2 matches this Megatron recipe."),
+        Parameter(help="Multiplier for rms_norm: scale * sqrt(max(rows, cols)); 0.2 keeps the historical RMS ratio."),
     ] = 0.2
     enable_all2all: Annotated[
         bool, Parameter(help="Allow all-to-all comm strategy; set False on topologies where all-to-all is unreliable")
@@ -175,6 +179,15 @@ class MuonConfig(OptimConfig):
         Parameter(help="Weight decay for 1D / bias parameters in the AdamW group. None uses weight_decay."),
     ] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _concept_muon_defaults(cls, data):
+        # The split-projection layout expects Muon-group gradients to be clipped
+        # together with the AdamW groups; keep the historical default otherwise.
+        if isinstance(data, dict) and data.get("concept_muon") and "clip_grad_mode" not in data:
+            data = {**data, "clip_grad_mode": "all"}
+        return data
+
     def build(self, model):
         trainable_parameters_names = model.trainable_parameters()
         trainable_names = {name for name, _ in trainable_parameters_names}
@@ -182,7 +195,7 @@ class MuonConfig(OptimConfig):
         muon_split_sizes = {}
         muon_qkv_split_shapes = {}
         metadata = {}
-        if self.megatron_compatible:
+        if self.concept_muon:
             provider = getattr(model, "get_muon_metadata", None)
             if callable(provider):
                 metadata = provider()
@@ -365,9 +378,9 @@ class MuonConfig(OptimConfig):
                 )
             logger.info(f"Untrainable parameters names: {untrainable_names}")
 
-        optimizer_cls = MegatronMuon if self.megatron_compatible else Muon
+        optimizer_cls = ConceptMuon if self.concept_muon else Muon
         optimizer_kwargs = {}
-        if self.megatron_compatible:
+        if self.concept_muon:
             optimizer_kwargs["muon_adamw_ranges"] = metadata.get("adamw_ranges", {})
         optimizer = optimizer_cls(
             param_groups,

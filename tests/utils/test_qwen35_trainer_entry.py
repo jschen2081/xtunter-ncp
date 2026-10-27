@@ -9,12 +9,14 @@ import os
 import subprocess
 import sys
 import time
+from itertools import accumulate
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "examples/v1/scripts/qwen35_9b_alignment"
@@ -191,13 +193,17 @@ class TestConceptLMNativeContext:
     def loss_config(self):
         # Load the real loss classes while omitting package initializers only.
         base = load_ast("xtuner/v1/loss/base_loss_ctx.py", {"Parameter": lambda **kwargs: None}, ("cyclopts",))
+        seq = load_ast(
+            "xtuner/v1/module/concept_sequence.py", {"SequenceContext": object}, ("xtuner.v1.data_proto",)
+        )
+        base["padded_document_lengths"] = seq["padded_document_lengths"]
         loss = load_ast("xtuner/v1/loss/conceptlm_loss.py", base, (
             "base_loss_ctx", "xtuner.v1.module.concept_quantizer", "xtuner.v1.module.concept_sequence",
         ))
         return loss["ConceptLMLossConfig"]()
 
     @staticmethod
-    def loss_data(lengths: list[int], sp_mesh=None):
+    def loss_data(lengths: list[int], sp_mesh=None, valid_length: int | None = None):
         boundaries = [0]
         for length in lengths:
             boundaries.append(boundaries[-1] + length)
@@ -206,30 +212,52 @@ class TestConceptLMNativeContext:
                 input_ids=torch.zeros(1, sum(lengths), dtype=torch.long),
                 cu_seq_lens_q=torch.tensor(boundaries, dtype=torch.int32),
                 sequence_parallel_mesh=sp_mesh,
+                valid_sequence_length=valid_length,
             ),
             "shifted_labels": torch.zeros(1, sum(lengths), dtype=torch.long),
         }
 
     @pytest.mark.parametrize("chunk_size", [2, 4, 8])
-    @pytest.mark.parametrize("chunks_per_document", [(1,), (2, 1), (1, 2), (0, 2)])
-    def test_rejects_documents_padded_to_two_chunks(self, loss_config, chunk_size, chunks_per_document):
+    @pytest.mark.parametrize("chunks_per_document", [(1,), (2, 1), (1, 2)])
+    def test_pads_documents_shorter_than_two_chunks(self, loss_config, chunk_size, chunks_per_document):
+        # The model pads short documents with pad tokens; the loss grows its mask
+        # the same way with zeros so padded concepts carry no valid target.
         loss_config.concept_chunk_size = chunk_size
-        data = self.loss_data([chunks * chunk_size for chunks in chunks_per_document])
-        with pytest.raises(ValueError, match="at least 2 concept chunks.*model padding"):
+        lengths = [chunks * chunk_size for chunks in chunks_per_document]
+        data = self.loss_data(lengths)
+        result = loss_config.build(data)
+        padded = [max(2 * chunk_size, length) for length in lengths]
+        assert result.loss_kwargs.boundaries.tolist() == [0, *accumulate(padded)]
+        assert result.loss_kwargs.loss_mask.shape[1] == sum(padded)
+        assert int(result.loss_kwargs.loss_mask.sum()) == sum(lengths)
+
+    @pytest.mark.parametrize("chunks_per_document", [(0, 2), (2, 0)])
+    def test_rejects_empty_documents(self, loss_config, chunks_per_document):
+        data = self.loss_data([chunks * loss_config.concept_chunk_size for chunks in chunks_per_document])
+        with pytest.raises(ValueError, match="empty documents"):
             loss_config.build(data)
 
-    def test_rejects_unaligned_document(self, loss_config):
-        with pytest.raises(ValueError, match="align to concept chunks"):
-            loss_config.build(self.loss_data([10]))
+    def test_pads_chunk_unaligned_document(self, loss_config):
+        data = self.loss_data([10])
+        result = loss_config.build(data)
+        assert result.loss_kwargs.boundaries.tolist() == [0, 12]
+        assert int(result.loss_kwargs.loss_mask.sum()) == 10
+        assert int(result.loss_kwargs.loss_mask[:, 10:].sum()) == 0
 
     @pytest.mark.parametrize("sp_size", [2, 4, 8])
     @pytest.mark.parametrize("from_context", [False, True])
-    def test_rejects_sp_tail_padding(self, loss_config, sp_size, from_context):
+    def test_extends_last_document_for_sp_tail_padding(self, loss_config, sp_size, from_context):
         mesh = SimpleNamespace(size=lambda: sp_size)
         # Each document is at least two chunks, but the global total needs SP padding.
-        data = self.loss_data([8, sp_size * 4 + 4], mesh if from_context else None)
-        with pytest.raises(ValueError, match="SP size.*model tail padding"):
-            loss_config.build(data, sp_mesh=None if from_context else mesh)
+        lengths = [8, sp_size * 4 + 4]
+        data = self.loss_data(lengths, mesh if from_context else None)
+        result = loss_config.build(data, sp_mesh=None if from_context else mesh)
+        total = sum(lengths)
+        tail = (-total) % (sp_size * 4)
+        assert result.loss_kwargs.boundaries.tolist() == [0, lengths[0], total + tail]
+        assert result.loss_kwargs.loss_mask.shape[1] == total + tail
+        assert int(result.loss_kwargs.loss_mask.sum()) == total
+        assert int(result.loss_kwargs.loss_mask[:, total:].sum()) == 0
 
     @pytest.mark.parametrize("chunk_size", [2, 4, 8])
     @pytest.mark.parametrize("sp_size", [1, 2, 4, 8])
@@ -241,6 +269,39 @@ class TestConceptLMNativeContext:
         assert result is not None
         torch.testing.assert_close(result.loss_kwargs.boundaries, data["seq_ctx"].cu_seq_lens_q)
         torch.testing.assert_close(result.loss_kwargs.loss_mask, data["shifted_labels"].ne(-100))
+
+    @pytest.mark.parametrize("sp_size", [2, 4, 8])
+    def test_sp_scopes_loss_to_valid_region_beyond_pack_padding(self, loss_config, sp_size):
+        # The collator records pack padding as extra documents beyond the valid
+        # region; the SP model path strips them, so the loss must scope to the
+        # same real documents instead of crashing on a concept count mismatch.
+        mesh = SimpleNamespace(size=lambda: sp_size)
+        valid = 2 * 4 * sp_size
+        data = self.loss_data([valid, 256], sp_mesh=mesh, valid_length=valid)
+        result = loss_config.build(data)
+        torch.testing.assert_close(
+            result.loss_kwargs.boundaries, torch.tensor([0, valid], dtype=torch.int32)
+        )
+        assert result.loss_kwargs.loss_mask.shape[1] == valid
+
+    def test_sp_scoping_pads_misaligned_valid_region(self, loss_config):
+        # A valid region that is not SP-aligned is padded on its last document,
+        # matching the model's tail padding, with the padded concepts masked out.
+        mesh = SimpleNamespace(size=lambda: 2)
+        data = self.loss_data([12, 8], sp_mesh=mesh, valid_length=12)
+        result = loss_config.build(data)
+        assert result.loss_kwargs.boundaries.tolist() == [0, 16]
+        assert result.loss_kwargs.loss_mask.shape[1] == 16
+        assert int(result.loss_kwargs.loss_mask.sum()) == 12
+        assert int(result.loss_kwargs.loss_mask[:, 12:].sum()) == 0
+
+    def test_non_sp_keeps_pack_padding_documents(self, loss_config):
+        # Without SP the model keeps padding documents; the loss must too.
+        data = self.loss_data([16, 8])
+        result = loss_config.build(data)
+        torch.testing.assert_close(
+            result.loss_kwargs.boundaries, torch.tensor([0, 16, 24], dtype=torch.int32)
+        )
 
     def test_cpu_labels_follow_sequence_device(self, loss_config) -> None:
         labels = torch.zeros(1, 8, dtype=torch.long)
