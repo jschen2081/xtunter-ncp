@@ -326,7 +326,7 @@ class MoEDecoderLayer(nn.Module):
         hidden_factor: float = 1.0,
         attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig | KDAConfig,
         rope_scaling_cfg: RopeScalingConfig | None = None,
-        layer_type: Literal["full_attention", "sliding_attention"] | None = None,
+        layer_type: Literal["full_attention", "sliding_attention", "linear_attention"] | None = None,
         generate_config: GenerateConfig | None = None,
         router_config: GreedyRouterConfig | NoAuxRouterConfig,
         router_compute_dtype: Literal["float32", "native"] = "float32",
@@ -364,7 +364,7 @@ class MoEDecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 generate_config=generate_config,
                 rope_scaling_cfg=rope_scaling_cfg,
-                layer_type=layer_type,
+                layer_type=cast(Literal["full_attention", "sliding_attention"] | None, layer_type),
                 float8_cfg=float8_cfg,
             )
         )
