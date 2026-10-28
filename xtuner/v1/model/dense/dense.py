@@ -207,16 +207,11 @@ class Dense(BaseModel):
 
         last_layer_idx = config.num_hidden_layers - 1
         layer_type = mtp_config.decoder_layer_type or config.layers_type[last_layer_idx]
-        decoder_layer_kwargs: dict[str, Any] = {}
-        if layer_type == "linear_attention":
+        if layer_type in ["full_attention", "sliding_attention"]:
+            attention_config = config.attention
+        elif layer_type == "linear_attention":
             assert config.linear_attention is not None
             attention_config = config.linear_attention
-        elif layer_type == "full_attention":
-            attention_config = config.attention
-            decoder_layer_kwargs["layer_type"] = "full_attention"
-        elif layer_type == "sliding_attention":
-            attention_config = config.attention
-            decoder_layer_kwargs["layer_type"] = "sliding_attention"
         else:
             raise ValueError(f"Unsupported MTP layer type {layer_type}")
 
@@ -234,8 +229,8 @@ class Dense(BaseModel):
                 generate_config=config.generate_config,
                 rope_scaling_cfg=config.rope_scaling_cfg,
                 float8_cfg=config.float8_cfg,
+                layer_type=layer_type,  # type: ignore[arg-type]
                 layer_idx=config.num_hidden_layers + mtp_idx,
-                **decoder_layer_kwargs,
             )
             mtp_layers.append(
                 MTPLayer(
