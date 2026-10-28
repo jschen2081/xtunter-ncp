@@ -15,9 +15,7 @@ class Qwen3_5_VLTextDense(Qwen3VLTextDense):
         if key.startswith("mtp_block."):
             key = key.removeprefix("mtp_block.")
             key = re.sub(r"layers\.(\d+)\.decoder_layer\.", r"layers.\1.", key)
-            mtp_config = self.config.mtp_config
-            assert mtp_config is not None
-            mtp_layer_type = mtp_config.decoder_layer_type or self.config.layers_type[-1]
+            mtp_layer_type = self.config.mtp_config.decoder_layer_type or self.config.layers_type[-1]  # type: ignore[union-attr]
             if mtp_layer_type == "linear_attention":
                 key = key.replace("self_attn", "linear_attn")
             if ".enorm." in key:
