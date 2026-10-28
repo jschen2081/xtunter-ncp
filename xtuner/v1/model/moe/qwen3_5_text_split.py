@@ -124,6 +124,8 @@ class Qwen3_5_VLTextMoESplitConfig(MoEConfig):
         fp32_keys_pattern=[
             r"model(?:\.language_model)?\.layers\.\d+\.linear_attn\.norm\.weight",
             r"model(?:\.language_model)?\.layers\.\d+\.linear_attn\.A_log",
+            r"^mtp\.layers\.\d+\.linear_attn\.norm\.weight$",
+            r"^mtp\.layers\.\d+\.linear_attn\.A_log$",
         ],
     )
 

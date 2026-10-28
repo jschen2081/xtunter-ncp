@@ -3,7 +3,7 @@ import contextlib
 import os
 import types
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, Self, Sequence, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, Sequence, TypedDict, cast
 
 import torch
 import torch.distributed as dist
@@ -1259,13 +1259,18 @@ class MoE(BaseModel):
         last_layer_idx = config.num_hidden_layers - 1
         layer_type = mtp_config.decoder_layer_type or config.layers_type[last_layer_idx]
         attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig
-        if layer_type in ["full_attention", "sliding_attention"]:
-            attention_config = config.attention
-        elif layer_type == "linear_attention":
+        decoder_layer_kwargs: dict[str, Any] = {}
+        if layer_type == "linear_attention":
             assert config.linear_attention is not None, (
                 "linear_attention config must be provided for linear_attention layer"
             )
             attention_config = config.linear_attention
+        elif layer_type == "full_attention":
+            attention_config = config.attention
+            decoder_layer_kwargs["layer_type"] = "full_attention"
+        elif layer_type == "sliding_attention":
+            attention_config = config.attention
+            decoder_layer_kwargs["layer_type"] = "sliding_attention"
         else:
             raise ValueError(f"Unsupported layer type {layer_type}")
 
@@ -1287,7 +1292,7 @@ class MoE(BaseModel):
                 n_shared_experts=config.n_shared_experts,
                 with_shared_expert_gate=config.with_shared_expert_gate,
                 hidden_factor=config.hidden_factor,
-                layer_type=layer_type,
+                **decoder_layer_kwargs,
                 attention_config=attention_config,
                 rope_scaling_cfg=config.rope_scaling_cfg,
                 generate_config=config.generate_config,

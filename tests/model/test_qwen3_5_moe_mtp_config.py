@@ -23,6 +23,9 @@ def test_builds_linear_attention_mtp_and_maps_hf_keys(config_cls) -> None:
     assert model.mtp_block is not None
     mtp_decoder = model.mtp_block.layers[0].decoder_layer
     assert type(mtp_decoder.self_attn) is type(model.layers["0"].self_attn)
-    assert model.to_hf_key_list("mtp_block.layers.0.decoder_layer.self_attn.in_proj.weight") == [
-        "mtp.layers.0.linear_attn.in_proj.weight"
-    ]
+    in_proj_key = model.to_hf_key_list("mtp_block.layers.0.decoder_layer.self_attn.in_proj.weight")
+    assert in_proj_key == ["mtp.layers.0.linear_attn.in_proj.weight"]
+    assert model._get_save_dtype(in_proj_key[0], torch.bfloat16) is torch.bfloat16
+    for parameter_name in ("A_log", "norm.weight"):
+        hf_key = model.to_hf_key_list(f"mtp_block.layers.0.decoder_layer.self_attn.{parameter_name}")[0]
+        assert model._get_save_dtype(hf_key, torch.bfloat16) is torch.float32
