@@ -1,9 +1,8 @@
 """Work around a reproduced LLVM SLP crash in Qwen3.5 SP8 backward.
 
-Torch 2.9.1 / Triton 3.5.1 on SM90 aborts while compiling the (2, 64, 2)
-candidate of this BF16 multi-output reduction. Keep the other candidates and
-all numerical operations unchanged. Remove after validating the reproducer
-against a fixed compiler. Generated imports also cover spawn compile workers.
+Torch 2.9.1 / Triton 3.5.1 on SM90 aborts while compiling the (2, 64, 2) candidate of this BF16 multi-output reduction.
+Keep the other candidates and all numerical operations unchanged. Remove after validating the reproducer against a
+fixed compiler. Generated imports also cover spawn compile workers.
 """
 
 import functools
@@ -45,7 +44,8 @@ def _unsafe(config):
 
 
 def reduction(*args, **kwargs):
-    """Filter after cache lookup, so cached candidates cannot bypass the guard."""
+    """Filter after cache lookup, so cached candidates cannot bypass the
+    guard."""
     from torch._inductor.runtime import triton_heuristics
 
     decorate = triton_heuristics.reduction(*args, **kwargs)
@@ -73,7 +73,7 @@ def reduction(*args, **kwargs):
             if not safe:
                 raise RuntimeError("No safe Qwen3.5 reduction candidates remain")
             logger.warning(
-                "Qwen3.5 LLVM SLP workaround: excluding XBLOCK=2, R0_BLOCK=64, " "num_warps=2 for %s", fn.__name__
+                "Qwen3.5 LLVM SLP workaround: excluding XBLOCK=2, R0_BLOCK=64, num_warps=2 for %s", fn.__name__
             )
             tuner.configs = safe
         # Dynamic register-pressure tuning / coordinate descent can introduce
@@ -103,7 +103,6 @@ def patch_inductor_qwen35_reduction():
     if triton.__version__ != "3.5.1":
         return
     from torch._inductor.codegen.triton import TritonKernel
-
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
     global _ORIGINAL_PRECOMPILE
