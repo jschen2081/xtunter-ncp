@@ -1,8 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Product-vector quantizer for the ConceptLM concept stream.
 
-Port of ``megatron/core/models/conceptlm/quantizer.py`` from the reference
-implementation (``jxxiong/residual`` of ``megatron_ncp_qwen35``) so the XTuner
+Ported from the NCP Qwen3.5 ConceptLM reference implementation so the XTuner
 ConceptLM recipe keeps the same concept quantisation contract:
 
 * the hidden vector is split into ``num_codebooks`` heads of ``hidden / num_codebooks``;
@@ -110,37 +109,57 @@ class ConceptQuantizer(nn.Module):
         return vectors.reshape(logits.shape[0], logits.shape[1], self.hidden_size)
 
     def forward(self, concept_hidden: Tensor, concept_mask: Tensor | None = None) -> QuantizedConcepts:
-        if concept_hidden.dim() != 3 or concept_hidden.shape[-1] != self.hidden_size:
-            raise ValueError(
-                f"concept_hidden must have shape [S, B, {self.hidden_size}], got {tuple(concept_hidden.shape)}"
-            )
-        concept_seq, batch_size, _ = concept_hidden.shape
-        inputs = concept_hidden.reshape(concept_seq, batch_size, self.num_codebooks, self.head_dim)
-        codebook = self.transformed_codebook()
-        distances = (
-            inputs.float().square().sum(dim=-1, keepdim=True)
-            - 2.0 * torch.einsum("sbhd,hkd->sbhk", inputs.float(), codebook.float())
-            + codebook.float().square().sum(dim=-1).view(1, 1, self.num_codebooks, self.codebook_size)
+        return quantize_concepts(
+            concept_hidden,
+            self.transformed_codebook(),
+            concept_mask,
+            commitment_cost=self.commitment_cost,
         )
-        code_ids = torch.argmin(distances, dim=-1)
-        heads = [
-            codebook[idx]
-            .index_select(0, code_ids[..., idx].reshape(-1))
-            .reshape(concept_seq, batch_size, self.head_dim)
-            for idx in range(self.num_codebooks)
-        ]
-        quantized = torch.stack(heads, dim=2).reshape_as(concept_hidden).to(concept_hidden.dtype)
-        per_tensor = F.mse_loss(quantized.float(), concept_hidden.detach().float(), reduction="none").mean(dim=-1)
-        per_tensor = per_tensor + self.commitment_cost * F.mse_loss(
-            quantized.detach().float(), concept_hidden.float(), reduction="none"
-        ).mean(dim=-1)
-        if concept_mask is None:
-            numerator = per_tensor.sum()
-            count = concept_hidden.new_tensor(per_tensor.numel(), dtype=torch.float32)
-        else:
-            if concept_mask.dtype != torch.bool or tuple(concept_mask.shape) != (concept_seq, batch_size):
-                raise ValueError("concept_mask must be a bool tensor shaped [concept_seq, batch]")
-            numerator = per_tensor.masked_select(concept_mask).sum()
-            count = concept_mask.sum().to(dtype=torch.float32)
-        loss = numerator / count.clamp_min(1.0)
-        return QuantizedConcepts(quantized, code_ids, loss, numerator, count)
+
+
+def quantize_concepts(
+    concept_hidden: Tensor,
+    codebook: Tensor,
+    concept_mask: Tensor | None = None,
+    *,
+    commitment_cost: float = 0.25,
+) -> QuantizedConcepts:
+    """Quantize sequence-major concepts using an existing differentiable
+    codebook.
+
+    Shared by ConceptQuantizer.forward and models that already own codebook parameters. This function neither creates
+    nor registers new parameters.
+    """
+    if codebook.ndim != 3 or any(size <= 0 for size in codebook.shape):
+        raise ValueError("codebook must have shape [num_codebooks, codebook_size, head_dim]")
+    num_codebooks, codebook_size, head_dim = codebook.shape
+    hidden_size = num_codebooks * head_dim
+    if concept_hidden.dim() != 3 or concept_hidden.shape[-1] != hidden_size:
+        raise ValueError(f"concept_hidden must have shape [S, B, {hidden_size}], got {tuple(concept_hidden.shape)}")
+    concept_seq, batch_size, _ = concept_hidden.shape
+    inputs = concept_hidden.reshape(concept_seq, batch_size, num_codebooks, head_dim)
+    distances = (
+        inputs.float().square().sum(dim=-1, keepdim=True)
+        - 2.0 * torch.einsum("sbhd,hkd->sbhk", inputs.float(), codebook.float())
+        + codebook.float().square().sum(dim=-1).view(1, 1, num_codebooks, codebook_size)
+    )
+    code_ids = torch.argmin(distances, dim=-1)
+    heads = [
+        codebook[idx].index_select(0, code_ids[..., idx].reshape(-1)).reshape(concept_seq, batch_size, head_dim)
+        for idx in range(num_codebooks)
+    ]
+    quantized = torch.stack(heads, dim=2).reshape_as(concept_hidden).to(concept_hidden.dtype)
+    per_tensor = F.mse_loss(quantized.float(), concept_hidden.detach().float(), reduction="none").mean(dim=-1)
+    per_tensor = per_tensor + commitment_cost * F.mse_loss(
+        quantized.detach().float(), concept_hidden.float(), reduction="none"
+    ).mean(dim=-1)
+    if concept_mask is None:
+        numerator = per_tensor.sum()
+        count = concept_hidden.new_tensor(per_tensor.numel(), dtype=torch.float32)
+    else:
+        if concept_mask.dtype != torch.bool or tuple(concept_mask.shape) != (concept_seq, batch_size):
+            raise ValueError("concept_mask must be a bool tensor shaped [concept_seq, batch]")
+        numerator = per_tensor.masked_select(concept_mask).sum()
+        count = concept_mask.sum().to(dtype=torch.float32)
+    loss = numerator / count.clamp_min(1.0)
+    return QuantizedConcepts(quantized, code_ids, loss, numerator, count)

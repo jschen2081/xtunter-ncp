@@ -2,6 +2,7 @@
 # https://github.com/fla-org/flash-linear-attention/tree/v0.4.2/fla/ops/gated_delta_rule/chunk.py
 # to support torch.compile
 
+import inspect
 import warnings
 
 import torch
@@ -15,6 +16,32 @@ from fla.ops.gated_delta_rule.chunk import (
 )
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+
+def _uses_state_v_first(function) -> bool:
+    """Detect the FLA 0.5.x state-layout spelling without relying on package
+    metadata."""
+    parameters = inspect.signature(function).parameters
+    if "state_v_first" in parameters:
+        return True
+    if "transpose_state_layout" in parameters:
+        return False
+    raise ImportError(
+        f"Unsupported FLA API: {function.__module__}.{function.__name__} has neither "
+        "`state_v_first` nor `transpose_state_layout`"
+    )
+
+
+_FLA_FWD_USES_STATE_V_FIRST = _uses_state_v_first(origin_chunk_gated_delta_rule_fwd)
+_FLA_BWD_USES_STATE_V_FIRST = _uses_state_v_first(origin_chunk_gated_delta_rule_bwd)
+if _FLA_FWD_USES_STATE_V_FIRST != _FLA_BWD_USES_STATE_V_FIRST:
+    raise ImportError("FLA gated-delta forward and backward use inconsistent state-layout APIs")
+
+
+def _fla_state_layout_kwargs(transpose_state_layout: bool) -> dict[str, bool]:
+    if _FLA_FWD_USES_STATE_V_FIRST:
+        return {"state_v_first": transpose_state_layout}
+    return {"transpose_state_layout": transpose_state_layout}
 
 
 @torch.library.custom_op(
@@ -43,7 +70,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu)
     # XTuner does not use FLA context parallelism; keep the custom op schema compile-friendly.
     cp_context = None
-    g, o, A, final_state, initial_state = origin_chunk_gated_delta_rule_fwd(
+    outputs = origin_chunk_gated_delta_rule_fwd(
         q=q,
         k=k,
         v=v,
@@ -55,8 +82,17 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         cp_context=cp_context,
         chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
+        **_fla_state_layout_kwargs(transpose_state_layout),
     )
+    if _FLA_FWD_USES_STATE_V_FIRST:
+        # FLA 0.5.x additionally returns g_input for its optional fused-gate
+        # path. XTuner passes the already-computed gate, so it must be None.
+        g, o, A, final_state, initial_state, g_input = outputs
+        if g_input is not None:
+            raise RuntimeError("FLA unexpectedly enabled use_gate_in_kernel")
+    else:
+        # Preserve the exact FLA 0.4.2 return contract.
+        g, o, A, final_state, initial_state = outputs
     # initial_state is None in current XTuner implementation,
     # if not None, clone it to ensure the output of this custom operator must not also be an input
     initial_state = initial_state.clone() if initial_state is not None else initial_state
@@ -145,7 +181,7 @@ def chunk_gated_delta_rule_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # XTuner does not use FLA context parallelism; keep the custom op schema compile-friendly.
     cp_context = None
-    dq, dk, dv, db, dg, dh0 = origin_chunk_gated_delta_rule_bwd(
+    outputs = origin_chunk_gated_delta_rule_bwd(
         q=q,
         k=k,
         v=v,
@@ -159,8 +195,17 @@ def chunk_gated_delta_rule_bwd(
         cu_seqlens=cu_seqlens,
         cp_context=cp_context,
         chunk_indices=chunk_indices,
-        transpose_state_layout=transpose_state_layout,
+        **_fla_state_layout_kwargs(transpose_state_layout),
     )
+    if _FLA_BWD_USES_STATE_V_FIRST:
+        # FLA 0.5.x returns gradients for its optional fused A_log/dt_bias
+        # inputs. This wrapper does not enable that path.
+        dq, dk, dv, db, dg, dh0, dA_log, ddt_bias = outputs
+        if dA_log is not None or ddt_bias is not None:
+            raise RuntimeError("FLA unexpectedly returned fused-gate gradients")
+    else:
+        # Preserve the exact FLA 0.4.2 return contract.
+        dq, dk, dv, db, dg, dh0 = outputs
     return dq, dk, dv, db, dg, dh0
 
 

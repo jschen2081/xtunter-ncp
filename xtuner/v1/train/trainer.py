@@ -34,7 +34,6 @@ from mmengine.runner import set_random_seed
 from pydantic import BaseModel, ConfigDict, field_serializer, field_validator, model_serializer, model_validator
 from torch.distributed import init_process_group
 from torch.distributed.device_mesh import init_device_mesh
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 from typing_extensions import NotRequired, Self, TypedDict
 
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -79,6 +78,7 @@ from xtuner.v1.utils.internal_metrics import (
     InternalMetricsRecorder,
     flatten_internal_metrics_for_logs,
 )
+from xtuner.v1.utils.lr_scheduler import build_lr_scheduler
 
 from .toy_tokenizer import UTF8ByteTokenizer
 
@@ -433,7 +433,7 @@ class TrainerConfig(BaseModel):
     check_health_interval: int | None = None
     hf_interval: int | None = None
     hf_max_keep: int | None = None
-    exp_tracker: Literal["tensorboard", "jsonl"] = "jsonl"
+    exp_tracker: Literal["tensorboard", "jsonl", "both"] = "jsonl"
     profile_step: list[int] | int | None = None
     profile_time: bool = True
     profile_memory: bool = False
@@ -559,7 +559,7 @@ class Trainer:
         check_health_interval: int | None = None,
         hf_interval: int | None = None,
         hf_max_keep: int | None = None,
-        exp_tracker: Literal["tensorboard", "jsonl"] = "jsonl",
+        exp_tracker: Literal["tensorboard", "jsonl", "both"] = "jsonl",
         profile_step: list[int] | int | None = None,
         profile_time: bool = True,
         profile_memory: bool = False,
@@ -1107,7 +1107,7 @@ class Trainer:
         logger.add(sys.stderr, format=log_format(rank=get_rank()), level=log_level)
         return logger, log_dir
 
-    def _init_tracker(self, exp_tracker: Literal["tensorboard", "jsonl"], log_dir: Path):
+    def _init_tracker(self, exp_tracker: Literal["tensorboard", "jsonl", "both"], log_dir: Path):
         writer = get_writer(writer_type=exp_tracker, log_dir=log_dir)
         return writer
 
@@ -1197,38 +1197,7 @@ class Trainer:
         Returns:
             torch.optim.lr_scheduler.LRScheduler: Configured learning rate scheduler.
         """
-        if lr_cfg.warmup_ratio < 1:
-            warmup_steps = int(lr_cfg.warmup_ratio * scheduler_step)
-        else:
-            warmup_steps = int(lr_cfg.warmup_ratio)
-
-        def warmup_fn(x):
-            return x / warmup_steps if x < warmup_steps else 1
-
-        warmup_scheduler = LambdaLR(self._engine.optimizer, warmup_fn)
-
-        scheduler: torch.optim.lr_scheduler.LRScheduler
-        if lr_cfg.lr_type == "linear":
-            scheduler = LinearLR(
-                self._engine.optimizer,
-                start_factor=1.0,
-                end_factor=lr_cfg.lr_min / self._engine.optimizer.defaults["lr"],
-                total_iters=scheduler_step - warmup_steps,
-            )
-        elif lr_cfg.lr_type == "cosine":
-            scheduler = CosineAnnealingLR(
-                self._engine.optimizer, T_max=scheduler_step - warmup_steps, eta_min=lr_cfg.lr_min
-            )
-        elif lr_cfg.lr_type == "constant":
-            scheduler = LambdaLR(self._engine.optimizer, lambda x: 1.0)
-        else:
-            raise ValueError(f"Unsupported lr type: {lr_cfg.lr_type}")
-        lr_scheduler = SequentialLR(
-            optimizer=self._engine.optimizer,
-            schedulers=[warmup_scheduler, scheduler],
-            milestones=[warmup_steps],
-        )
-        return lr_scheduler
+        return build_lr_scheduler(self._engine.optimizer, lr_cfg, scheduler_step)
 
     def _maybe_check_health(self):
         if self._check_health_interval is None:

@@ -2,6 +2,7 @@ from .aux_loss import AuxLossConfig, AuxLossContext
 from .base_loss_ctx import BaseLossConfig, BaseLossContext, BaseLossKwargs
 from .ce_loss import CELossConfig, CELossContext, LMHeadLossContext
 from .chunk_loss import ChunkLoss
+from .conceptlm_loss import ConceptLMLossConfig, ConceptLMLossContext
 from .moe_loss import (
     BalancingLossConfig,
     BalancingLossContext,
@@ -15,6 +16,8 @@ from .rl_loss import LogProbConfig, LogProbContext
 
 
 __all__ = [
+    "ConceptLMLossConfig",
+    "ConceptLMLossContext",
     "BalancingLossConfig",
     "BalancingLossContext",
     "BalancingLossKwargs",

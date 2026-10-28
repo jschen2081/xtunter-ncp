@@ -13,7 +13,7 @@ from xtuner.v1.utils.device import get_device
 
 # from xtuner.v1.profiler.prober import ProberList
 from .base_loss_ctx import BaseLossConfig, BaseLossContext, BaseLossKwargs
-from .chunk_loss import ChunkLoss
+from .chunk_loss import ChunkLoss, linear_with_grad_accumulation
 from .utils import sp_gather, sp_split
 
 
@@ -193,9 +193,13 @@ class LMHeadLossContext(BaseLossContext):
         head_bias: torch.Tensor | None,
         loss_kwargs: CELossKwargs,
         valid_vocab_size: int | None = None,
+        grad_weight_buffer: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         # We do linear forward here to simplify the implementation of chunk loss (saving memory).
-        logits = F.linear(hidden_states, head_weight, head_bias)
+        if grad_weight_buffer is None:
+            logits = F.linear(hidden_states, head_weight, head_bias)
+        else:
+            logits = linear_with_grad_accumulation(hidden_states, head_weight, grad_weight_buffer)
         physical_vocab_size = logits.size(-1)
         if valid_vocab_size is None:
             valid_vocab_size = physical_vocab_size
@@ -256,8 +260,16 @@ class LMHeadLossContext(BaseLossContext):
 
             chunks = loss_kwargs.chunk(self.loss_cfg.chunk_size)
             loss_forward = partial(self.loss_fn, valid_vocab_size=valid_vocab_size)
+            # Subclasses with another loss_fn retain the original callable contract.
+            accumulate_forward = loss_forward if type(self).loss_fn is LMHeadLossContext.loss_fn else None
             loss, extra_info = ChunkLoss.apply(
-                hidden_states, head_weight, head_bias, loss_forward, chunks, self.loss_cfg.chunk_size
+                hidden_states,
+                head_weight,
+                head_bias,
+                loss_forward,
+                chunks,
+                self.loss_cfg.chunk_size,
+                accumulate_forward,
             )
             return loss, (None, extra_info)
         else:

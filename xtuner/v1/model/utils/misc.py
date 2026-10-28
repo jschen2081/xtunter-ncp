@@ -108,6 +108,11 @@ class ModelForwardExtraLogInfo(dict):
             "reduced_train_policy_kl1_sum",
             "reduced_train_policy_kl3_sum",
             "reduced_train_policy_valid_count",
+            # ConceptLM metrics arrive globally reduced per microbatch; summing
+            # over microbatches yields step totals.
+            "concept_vq_loss",
+            "concept_hlm_loss",
+            "concept_valid_targets",
         )
         max_keys = ("max_ratio", "reduced_train_policy_ratio_max")
         min_keys = ("reduced_train_policy_ratio_min",)

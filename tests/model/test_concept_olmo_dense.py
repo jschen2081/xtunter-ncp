@@ -557,7 +557,7 @@ def test_concept_auxiliary_losses_use_next_concept_and_vq_mask():
     assert ncp_loss.ndim == 0
     assert vq_loss.ndim == 0
     (ncp_loss + vq_loss).backward()
-    # HLM target and the VQ input are detached, matching Megatron.
+    # HLM target and the VQ input are detached, matching the reference recipe.
     assert continuous.grad is None
     assert predicted.grad is not None
     assert model.concept_quantizer.codebook.grad is not None

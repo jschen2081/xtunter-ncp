@@ -90,7 +90,7 @@ class ConceptOlmoAttention(nn.Module):
         self.attn_impl_func: Callable[..., AttnOpOutputs] = get_attn_impl_fn(attn_impl)  # type: ignore[assignment]
 
     def get_muon_qkv_split_shapes(self) -> dict[nn.Parameter, tuple[int, int, int]]:
-        """Per-head Q, K, V row sizes for Megatron Muon.
+        """Per-head Q, K, V row sizes for semantic Muon layouts.
 
         Rows repeat ``(head_dim, head_dim, head_dim)`` once per head. The optimizer
         gathers every head's Q into one matrix before Newton-Schulz, and does the

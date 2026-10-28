@@ -31,7 +31,11 @@ def download_model_from_hub(
         str: The local path of the model.
     """
     if os.path.isdir(model_name_or_path):
+        if not os.access(model_name_or_path, os.R_OK | os.X_OK):
+            raise PermissionError(f"{model_name_or_path} is not readable by this user.")
         model_path = model_name_or_path
+    elif os.path.isabs(model_name_or_path):
+        raise FileNotFoundError(f"{model_name_or_path} is not a directory on this machine.")
     elif from_hub == "huggingface":
         from huggingface_hub import snapshot_download
 

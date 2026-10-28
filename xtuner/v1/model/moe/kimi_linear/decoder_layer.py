@@ -57,8 +57,12 @@ class _AttnResLayer(Protocol):
     self_attention_res_norm: RMSNorm
     mlp_res_proj: nn.Linear
     mlp_res_norm: RMSNorm
-    input_layernorm: RMSNorm
-    post_attention_layernorm: RMSNorm
+
+    @property
+    def input_layernorm(self) -> nn.Module: ...
+
+    @property
+    def post_attention_layernorm(self) -> nn.Module: ...
 
     @property
     def self_attn(self) -> nn.Module: ...

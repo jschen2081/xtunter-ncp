@@ -38,7 +38,7 @@
 
 ## 如何复用已有对齐工具
 
-本仓库 examples/v1/scripts/megatron_alignment/ 含真实捕获回放、比较、诊断、独立训练等工具，但其训练入口绑定Qwen3.5-9B ConceptLM配置。新模型只能复用适用的数据指纹、完成检查、观测/比较方法；不要直接调用绑定该模型的TrainEngine配置。
+本仓库 examples/v1/scripts/qwen35_9b_alignment/ 含真实捕获回放、比较、诊断、独立训练等工具，但其训练入口绑定Qwen3.5-9B ConceptLM配置。新模型只能复用适用的数据指纹、完成检查、观测/比较方法；不要直接调用绑定该模型的TrainEngine配置。
 
 先检查：字段schema、rank/micro身份、loss定义、canonical参数映射、完成marker与输出是否同名、CLI是否写死world/steps/vocab、调用链是否有调度副作用。适用时复用；不适用时按模型架构扩展正式接口和必要编排，不复制整套数学实现。
 

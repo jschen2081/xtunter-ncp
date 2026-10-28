@@ -37,6 +37,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.optim.optimizer import Optimizer, ParamsT
 
+from xtuner.v1.utils import log_rank0
 from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
 
 
@@ -298,8 +299,11 @@ class Muon(Optimizer):
         muon_split_sizes (dict[Tensor, tuple[int, ...]] | None): Logical row blocks that Muon should
             orthogonalize and scale independently. Used by GLM MuonSplit attention projections.
         muon_qkv_split_shapes (dict[Tensor, tuple[int, int, int]] | None): Per query-group
-            ``(q_rows, k_rows, v_rows)`` for head-interleaved fused QKV. Megatron gathers every
-            group's Q into one matrix (and likewise K and V) before Newton-Schulz.
+            ``(q_rows, k_rows, v_rows)`` for head-interleaved fused QKV. Every group's Q is
+            gathered into one matrix (and likewise K and V) before Newton-Schulz.
+        optim_state_dtype (torch.dtype | None): Dtype for momentum/variance buffers. ``None``
+            follows each parameter's dtype; pass ``torch.float32`` to keep optimizer state in
+            full precision while parameters stay low-precision.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -323,6 +327,8 @@ class Muon(Optimizer):
         remainder_strategy: Literal["agrs", "pad_all2all"] = "agrs",
         muon_split_sizes: dict[Tensor, tuple[int, ...]] | None = None,
         muon_qkv_split_shapes: dict[Tensor, tuple[int, int, int]] | None = None,
+        pre_orthogonalize_fn: Callable | None = None,
+        optim_state_dtype: torch.dtype | None = None,
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -356,9 +362,11 @@ class Muon(Optimizer):
         )
         super().__init__(params, defaults)
         self._enable_all2all = enable_all2all
+        self._pre_orthogonalize_fn = pre_orthogonalize_fn
         self._remainder_strategy = remainder_strategy
         self._muon_split_sizes = muon_split_sizes or {}
         self._muon_qkv_split_shapes = muon_qkv_split_shapes or {}
+        self._optim_state_dtype = optim_state_dtype
         self.register_state_dict_post_hook(self._remove_clip_grad_policy)
         self.register_load_state_dict_pre_hook(self._restore_clip_grad_policy)
 
@@ -400,7 +408,23 @@ class Muon(Optimizer):
                     # Gathered Q, K, and V apply their own ratio inside the orthogonalization callback.
                     state["lr_ratio"] = 1.0
                 else:
-                    state["lr_ratio"] = _get_muon_lr_ratio(p.shape[-2] // ne, p.shape[-1], adj, scale)
+                    if group["flatten"] and p.ndim >= 3:
+                        # Flattened to (shape[0], numel // shape[0]) before Newton-Schulz;
+                        # the ratio must use the flattened matrix, not the trailing dims.
+                        state["lr_ratio"] = _get_muon_lr_ratio(p.shape[0], p.numel() // p.shape[0], adj, scale)
+                    else:
+                        state["lr_ratio"] = _get_muon_lr_ratio(p.shape[-2] // ne, p.shape[-1], adj, scale)
+                    if p.ndim != 2 and ne == 1:
+                        # A non-matrix parameter (e.g. depthwise conv1d with shape
+                        # (C, 1, K)) lands in a Muon group and gets orthogonalized as a
+                        # flattened matrix. That is semantically valid, but such params
+                        # are often better served by element-wise AdamW; warn so the
+                        # routing can be revisited (param_options / get_muon_metadata).
+                        log_rank0.warning(
+                            f"Muon received a {p.ndim}D parameter of shape {tuple(p.shape)}; "
+                            "it will be flattened to 2D for orthogonalization. If this parameter "
+                            "should not be Muon-optimized, route it to AdamW explicitly."
+                        )
 
         # Newton-Schulz configuration
         if newton_schulz_func is not None:
@@ -454,6 +478,74 @@ class Muon(Optimizer):
     def _uses_internal_lr_ratio(self, param: Tensor) -> bool:
         return param in self._muon_split_sizes or param in self._muon_qkv_split_shapes
 
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        preserved: dict[tuple[Any, str], Tensor] = {}
+        if self._optim_state_dtype is not None:
+            # load_state_dict casts state tensors to the parameter dtype, which
+            # would destroy full-precision buffers for low-precision params.
+            # Stash the originals and put them back afterwards. Stash regardless
+            # of the checkpoint dtype: matching buffers are protected from the
+            # cast, lower-precision ones (e.g. BF16 momentum under an FP32
+            # config) are promoted to `optim_state_dtype` below.
+            for state_key, state in state_dict["state"].items():
+                for name in ("momentum", "variance", "gate_momentum", "gate_variance"):
+                    value = state.get(name)
+                    if isinstance(value, Tensor):
+                        preserved[(state_key, name)] = value
+        super().load_state_dict(state_dict)
+        if not preserved:
+            return
+        params = [p for group in self.param_groups for p in group["params"]]
+        for (state_key, name), value in preserved.items():
+            # Packed state dicts use integer indices; unpacked ones key by param.
+            param = state_key if isinstance(state_key, Tensor) else params[state_key]
+            # The preserved tensors come straight from the checkpoint dict and may
+            # still live on CPU (DCP cpu_offload); rebuild them on the parameter's
+            # device with the parameter's own sharding layout. Judge the expected
+            # layout from the parameter, not from the post-load state: torch's
+            # casting can demote a state to a plain tensor when the checkpoint
+            # value is unsharded, which would silently corrupt the state.
+            if isinstance(param, DTensor):
+                if not isinstance(value, DTensor):
+                    raise ValueError(
+                        f"Optimizer state {name!r} belongs to a sharded parameter but the checkpoint holds an "
+                        f"unsharded tensor of shape {tuple(value.shape)}; cross-topology checkpoint migration "
+                        "is unsupported. Restore with the same world layout (e.g. via DCP)."
+                    )
+                local = value.to_local()
+                param_local = param.to_local()
+                if local.shape != param_local.shape:
+                    raise ValueError(
+                        f"Optimizer state {name!r} checkpoint shard {tuple(local.shape)} does not match the "
+                        f"parameter's local shard {tuple(param_local.shape)}; cross-topology checkpoint "
+                        "migration is unsupported. Restore with the same world layout."
+                    )
+                local = local.to(device=param_local.device, dtype=self._optim_state_dtype)
+                # from_local infers the global shape as local*world (even
+                # sharding); pass the parameter's global shape/stride so uneven
+                # shards keep the true global shape.
+                self.state[param][name] = DTensor.from_local(
+                    local,
+                    param.device_mesh,
+                    param.placements,
+                    run_check=False,
+                    shape=param.shape,
+                    stride=param.stride(),
+                )
+            else:
+                if isinstance(value, DTensor):
+                    raise ValueError(
+                        f"Optimizer state {name!r} belongs to an unsharded parameter but the checkpoint holds a "
+                        "sharded DTensor; cross-topology checkpoint migration is unsupported. Restore with "
+                        "the same world layout."
+                    )
+                if value.shape != param.shape:
+                    raise ValueError(
+                        f"Optimizer state {name!r} checkpoint shape {tuple(value.shape)} does not match the "
+                        f"parameter shape {tuple(param.shape)}."
+                    )
+                self.state[param][name] = value.to(device=param.device, dtype=self._optim_state_dtype)
+
     @overload
     def step(self, closure: None = None) -> None: ...
 
@@ -499,9 +591,10 @@ class Muon(Optimizer):
         initialize it if it doesn't exist."""
         state = self.state[param]
         if "momentum" not in state:
-            state["momentum"] = torch.zeros_like(param)
+            dtype = self._optim_state_dtype or param.dtype
+            state["momentum"] = torch.zeros_like(param, dtype=dtype)
             if algo == "adamw":
-                state["variance"] = torch.zeros_like(param)
+                state["variance"] = torch.zeros_like(param, dtype=dtype)
         return state
 
     @staticmethod
@@ -811,6 +904,7 @@ class Muon(Optimizer):
                                 shard_dim=sharded_tensor_dim,
                                 process_group=group_process_group,
                                 num_experts=ns_num_experts,
+                                pre_orthogonalize_fn=self._pre_orthogonalize_fn,
                             )
                         )
 
@@ -848,6 +942,7 @@ class Muon(Optimizer):
                                 shard_dim=sharded_tensor_dim,
                                 process_group=comm_pg,
                                 num_experts=ns_num_experts,
+                                pre_orthogonalize_fn=self._pre_orthogonalize_fn,
                             )
                         )
 
@@ -914,6 +1009,7 @@ def muon_update_batch_async(
     process_group: ProcessGroup | None = None,  # Unified process group for communication
     num_experts: int = 1,  # Number of experts for MoE models
     batch_size: int | None = None,  # If set, pad X/G/M to this size with zeros
+    pre_orthogonalize_fn: Callable | None = None,
 ) -> Generator[None, None, None]:
     """Batched version of Muon update.
 
@@ -944,7 +1040,8 @@ def muon_update_batch_async(
         assert len(X) == world_size
 
     # Update momentum and compute the inputs for orthogonalization
-    U = muon_update_pre_orthogonalize(
+    prepare_update = muon_update_pre_orthogonalize if pre_orthogonalize_fn is None else pre_orthogonalize_fn
+    U = prepare_update(
         G=maybe_to_local(G),
         M=maybe_to_local(M),
         momentum=momentum,
@@ -1603,7 +1700,7 @@ def _muon_qkv_newton_schulz(
     adjust_lr: Literal["rms_norm", "spectral_norm", "none"],
     extra_scale_factor: float = 0.2,
 ) -> Tensor:
-    """Orthogonalize head-interleaved Q, K, and V the way Megatron Muon does.
+    """Orthogonalize head-interleaved Q, K, and V as role-gathered matrices.
 
     The weight rows repeat ``(q_rows, k_rows, v_rows)`` once per query group.
     All Q blocks are gathered into one matrix and orthogonalized together; K and V

@@ -1,9 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Qwen3.5 ConceptLM: encoder / predictor / decoder composition with MUDD.
 
-Port of the reference implementation (``megatron_ncp_qwen35`` @
-``jxxiong/residual``, ``examples/conceptlm``) onto XTuner's Qwen3.5 dense
-tower:
+Port of the NCP Qwen3.5 ConceptLM reference implementation onto XTuner's
+Qwen3.5 dense tower:
 
     tokens -> encoder stack (optional MUDD)
            -> chunk-4 mean-pooled concepts
@@ -44,8 +43,7 @@ from xtuner.v1.module.concept_sequence import (
     document_lengths,
     expand_concepts,
     merge_chunks,
-    shift_concepts_left,
-    successor_mask,
+    next_concept_mse,
 )
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.linear import build_linear
@@ -274,17 +272,12 @@ class ConceptLMQwen35(BaseModel):
         )
 
         # HLM: predict the next concept of the same document.
-        target_successor = shift_concepts_left(vq_target, concept_lengths)
-        if config.concept_detach_hlm_target:
-            target_successor = target_successor.detach()
-        # ``successor_mask`` returns XTuner's batch-major layout, so the batch size is
-        # dimension 0 (XTuner packs into a single batch element), not the concept length.
-        hlm_mask = successor_mask(concept_lengths, concept_hidden.shape[0], concept_hidden.device)
-        per_concept_hlm = F.mse_loss(
-            self.concept_vq_pred_norm(predicted).float(), target_successor.float(), reduction="none"
-        ).mean(dim=-1)
-        hlm_numerator = per_concept_hlm.masked_select(hlm_mask).sum()
-        hlm_count = hlm_mask.sum().to(dtype=torch.float32)
+        hlm_target = vq_target.detach() if config.concept_detach_hlm_target else vq_target
+        hlm_numerator, hlm_count = next_concept_mse(
+            self.concept_vq_pred_norm(predicted),
+            hlm_target,
+            concept_lengths,
+        )
 
         expanded = expand_concepts(predicted, doc_lengths, concept_lengths, chunk_size, config.concept_shift_feature)
         decoder_input = encoder_hidden + expanded.to(dtype=encoder_hidden.dtype)

@@ -22,6 +22,7 @@ from itertools import accumulate
 from typing import Literal, cast
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
@@ -33,6 +34,22 @@ def document_lengths(seq_ctx: SequenceContext) -> list[int]:
         return [int(seq_ctx.max_length_q.item())]
     lengths = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
     return [int(length) for length in lengths.detach().cpu().tolist()]
+
+
+def padded_document_lengths(lengths: list[int], chunk_size: int, sp_size: int = 1) -> list[int]:
+    """Document lengths after concept-stream padding.
+
+    Every document grows to at least two chunks and a chunk multiple so each
+    document yields at least one concept-successor pair. Under sequence
+    parallelism the final document additionally absorbs the tail padding that
+    aligns the total to ``sp_size * chunk_size`` per shard.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    padded = [max(2 * chunk_size, -(-length // chunk_size) * chunk_size) for length in lengths]
+    if sp_size > 1 and padded:
+        padded[-1] += (-sum(padded)) % (sp_size * chunk_size)
+    return padded
 
 
 def merge_chunks(
@@ -109,6 +126,31 @@ def successor_mask(concept_lengths: list[int], batch_size: int, device: torch.de
     if len(mask) == 1:
         return mask[0]
     return torch.cat(mask, dim=1)
+
+
+def next_concept_mse(
+    predicted: Tensor,
+    target: Tensor,
+    concept_lengths: list[int],
+    valid_mask: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Sum next-concept MSE within documents and count valid successors.
+
+    Callers own normalization and target detachment. An optional batch-major concept mask excludes invalid target
+    concepts without crossing documents.
+    """
+    if predicted.shape != target.shape or predicted.ndim != 3:
+        raise ValueError("HLM predictions and targets must have matching [B, S, H] shapes")
+    if any(length <= 0 for length in concept_lengths) or sum(concept_lengths) != target.shape[1]:
+        raise ValueError("Concept lengths must cover the HLM sequence")
+    target_successor = shift_concepts_left(target, concept_lengths)
+    valid = successor_mask(concept_lengths, target.shape[0], target.device)
+    if valid_mask is not None:
+        if valid_mask.dtype != torch.bool or valid_mask.shape != target.shape[:2]:
+            raise ValueError("HLM valid_mask must be bool with shape [B, S]")
+        valid &= shift_concepts_left(valid_mask, concept_lengths)
+    per_concept = F.mse_loss(predicted.float(), target_successor.float(), reduction="none").mean(dim=-1)
+    return per_concept.masked_select(valid).sum(), valid.sum().to(torch.float32)
 
 
 def expand_concepts(
