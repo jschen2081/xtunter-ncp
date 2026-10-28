@@ -55,6 +55,9 @@ class Qwen3_5_VLTextMoE(Qwen3VLTextMoE):
             # xtuner: mtp_block.layers.{idx}.decoder_layer.{param}
             # HF: mtp.layers.{idx}.{param}
             key = re.sub(r"layers\.(\d+)\.decoder_layer\.", r"layers.\1.", key)
+            mtp_layer_type = self.config.mtp_config.decoder_layer_type or self.config.layers_type[-1]  # type: ignore[union-attr]
+            if mtp_layer_type == "linear_attention":
+                key = key.replace("self_attn", "linear_attn")
 
             # Handle MTP normalization layers
             # xtuner: mtp_block.layers.{idx}.enorm -> HF: mtp.pre_fc_norm_embedding
@@ -182,6 +185,8 @@ class Qwen3_5_VLTextMoEConfig(MoEConfig):
         fp32_keys_pattern=[
             r"model\.language_model\.layers\.\d+\.linear_attn\.norm\.weight",
             r"model\.language_model\.layers\.\d+\.linear_attn\.A_log",
+            r"^mtp\.layers\.\d+\.linear_attn\.norm\.weight$",
+            r"^mtp\.layers\.\d+\.linear_attn\.A_log$",
         ],
     )
 

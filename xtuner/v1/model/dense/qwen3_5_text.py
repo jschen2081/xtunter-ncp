@@ -15,6 +15,9 @@ class Qwen3_5_VLTextDense(Qwen3VLTextDense):
         if key.startswith("mtp_block."):
             key = key.removeprefix("mtp_block.")
             key = re.sub(r"layers\.(\d+)\.decoder_layer\.", r"layers.\1.", key)
+            mtp_layer_type = self.config.mtp_config.decoder_layer_type or self.config.layers_type[-1]  # type: ignore[union-attr]
+            if mtp_layer_type == "linear_attention":
+                key = key.replace("self_attn", "linear_attn")
             if ".enorm." in key:
                 key = re.sub(r"layers\.\d+\.enorm\.", "pre_fc_norm_embedding.", key)
             elif ".hnorm." in key:
@@ -59,6 +62,8 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
         fp32_keys_pattern=[
             r"model\.language_model\.layers\.\d+\.linear_attn\.norm\.weight",
             r"model\.language_model\.layers\.\d+\.linear_attn\.A_log",
+            r"^mtp\.layers\.\d+\.linear_attn\.norm\.weight$",
+            r"^mtp\.layers\.\d+\.linear_attn\.A_log$",
         ],
     )
     mudd_enabled: bool = False

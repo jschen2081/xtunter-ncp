@@ -1255,19 +1255,19 @@ class MoE(BaseModel):
         assert mtp_config is not None, "mtp_config must be provided"
 
         mtp_layers = []
-        # Get attention config for MTP layers (use last layer's config)
+        # Get attention config for MTP layers (use last layer's config by default)
         last_layer_idx = config.num_hidden_layers - 1
-        layers_type_list = config.layers_type
+        layer_type = mtp_config.decoder_layer_type or config.layers_type[last_layer_idx]
         attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig
-        if layers_type_list[last_layer_idx] in ["full_attention", "sliding_attention"]:
+        if layer_type in ["full_attention", "sliding_attention"]:
             attention_config = config.attention
-        elif layers_type_list[last_layer_idx] == "linear_attention":
+        elif layer_type == "linear_attention":
             assert config.linear_attention is not None, (
                 "linear_attention config must be provided for linear_attention layer"
             )
             attention_config = config.linear_attention
         else:
-            raise ValueError(f"Unsupported layer type {layers_type_list[last_layer_idx]}")
+            raise ValueError(f"Unsupported layer type {layer_type}")
 
         num_physical_layer = 1 if mtp_config.share_weights else mtp_config.num_layers
         for i in range(num_physical_layer):
@@ -1287,7 +1287,7 @@ class MoE(BaseModel):
                 n_shared_experts=config.n_shared_experts,
                 with_shared_expert_gate=config.with_shared_expert_gate,
                 hidden_factor=config.hidden_factor,
-                layer_type=layers_type_list[last_layer_idx],
+                layer_type=layer_type,  # type: ignore[arg-type]
                 attention_config=attention_config,
                 rope_scaling_cfg=config.rope_scaling_cfg,
                 generate_config=config.generate_config,
