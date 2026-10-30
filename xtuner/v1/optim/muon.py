@@ -294,8 +294,11 @@ class Muon(Optimizer):
             force the all-gather + reduce-scatter (AGRS) path for all sharded batches. Useful on cluster
             topologies where all-to-all is unreliable.
         remainder_strategy (str): Communication strategy for parameter batches smaller than world size.
-            ``"agrs"`` uses all-gather + reduce-scatter without batch padding. ``"pad_all2all"`` restores
-            the original FSDP2 Muon behavior by zero-padding the batch to world size and using all-to-all.
+            ``"pad_all2all"`` (default) zero-pads the batch to world size and uses all-to-all; its time
+            and peak memory stay flat in the remainder size. ``"agrs"`` uses all-gather + reduce-scatter
+            without batch padding: it all-gathers every matrix of the batch onto every rank while each
+            rank orthogonalizes only R/W of them, so both its time and its peak memory grow linearly
+            with the batch size (measured upstream at world size 8: 2.0GB vs 0.66GB at R=7).
         muon_split_sizes (dict[Tensor, tuple[int, ...]] | None): Logical row blocks that Muon should
             orthogonalize and scale independently. Used by GLM MuonSplit attention projections.
         muon_qkv_split_shapes (dict[Tensor, tuple[int, int, int]] | None): Per query-group
@@ -324,7 +327,7 @@ class Muon(Optimizer):
         use_triton: bool = False,
         newton_schulz_func: Callable | None = None,
         enable_all2all: bool = True,
-        remainder_strategy: Literal["agrs", "pad_all2all"] = "agrs",
+        remainder_strategy: Literal["agrs", "pad_all2all"] = "pad_all2all",
         muon_split_sizes: dict[Tensor, tuple[int, ...]] | None = None,
         muon_qkv_split_shapes: dict[Tensor, tuple[int, int, int]] | None = None,
         pre_orthogonalize_fn: Callable | None = None,
@@ -342,7 +345,9 @@ class Muon(Optimizer):
         if remainder_strategy not in ("agrs", "pad_all2all"):
             raise ValueError(f"Invalid remainder_strategy: {remainder_strategy!r}; expected 'agrs' or 'pad_all2all'.")
         if not enable_all2all and remainder_strategy == "pad_all2all":
-            raise ValueError("remainder_strategy='pad_all2all' requires enable_all2all=True.")
+            # Without all-to-all AGRS is the only remainder path, so coerce the
+            # strategy instead of rejecting the default combination.
+            remainder_strategy = "agrs"
 
         # Default arguments for each param group
         defaults = dict(
@@ -807,10 +812,14 @@ class Muon(Optimizer):
                         sharded_tensor_dim = None
                         skip_communication = True
 
-                    elif fsdp_size % ns_num_experts == 0 and len(mesh_params) < fsdp_size:
-                        # Case B: each expert spans a sub-group of ranks → sub-group all-gather
-                        # Guard: only when params can't fill a batch, otherwise batched all-to-all
-                        # is more efficient (fewer kernel launches, better bandwidth utilization).
+                    elif fsdp_size % ns_num_experts == 0:
+                        # Case B: each expert spans a sub-group of ranks → sub-group all-gather.
+                        # No len(mesh_params) guard: a deep MoE whose expert params fill a whole
+                        # batch must not fall back to the full-group all-to-all + AGRS remainder,
+                        # which reconstructs the whole multi-expert matrix on every rank and blows
+                        # up memory (upstream measured on GLM-5.2: 76 fused expert weights over a
+                        # 64-rank FSDP mesh). The sub-group path orthogonalizes per param
+                        # (batch_size=1), trading extra kernel launches for bounded memory.
                         sg_size = fsdp_size // ns_num_experts
                         ns_num_experts = 1  # After all-gather each rank has 1 complete expert
                         use_subgroup_allgather = True
