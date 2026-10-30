@@ -708,23 +708,41 @@ class BaseModel(nn.Module):
                 for hf_name in hf_name_list:
                     if any(re.search(p, hf_name) for p in patterns):  # type: ignore
                         self.__dict__.setdefault("_fsdp_ignored_param_names", set()).add(full_name)
-                        if not isinstance(param, DTensor):
-                            dist_param = nn.Parameter(
-                                distribute_tensor(
-                                    param, self.world_mesh, [Replicate() for _ in range(self.world_mesh.ndim)]
-                                ),
-                                requires_grad=param.requires_grad,
-                            )
-                            module.register_parameter(name, dist_param)
-                            ignored_params.add(dist_param)
+                        # FP32-ignored params must be world-wide replicas so
+                        # scale_and_reduce_grad / grad-norm cover every FSDP rank.
+                        # MoE may have already placed them on an EP-only (or EP x
+                        # expert-TP) mesh; normalize that layout here.
+                        if isinstance(param, DTensor):
+                            # Already DTensor(world_mesh, all Replicate) → no-op
+                            # (idempotent under MoE's layer-then-root _fully_shard).
+                            if param.device_mesh == self.world_mesh and all(
+                                isinstance(placement, Replicate) for placement in param.placements
+                            ):
+                                ignored_params.add(param)
+                                break
+                            # Any non-replicate placement → fail closed. Gathering
+                            # shards is outside this path's responsibility.
+                            if any(not isinstance(placement, Replicate) for placement in param.placements):
+                                raise ValueError(
+                                    f"FP32-ignored parameter {full_name} has non-replicate "
+                                    f"placements {tuple(param.placements)} on mesh "
+                                    f"{param.device_mesh}; cannot rematerialize as a "
+                                    f"world-wide replica without gathering shards."
+                                )
+                            # Fully-replicated DTensor on another mesh → rematerialize
+                            # via to_local() (local already holds the full value; never gather).
+                            local_param = param.to_local().detach()
                         else:
-                            # param is already a DTensor (e.g. distributed by
-                            # MoE._replicate_other_params on ep_mesh before _fully_shard
-                            # is called). We skip re-distributing on world_mesh and just
-                            # add it to ignored_params so FSDP leaves it alone.
-                            # ASSUMPTION: fp32 distribution always happens AFTER any
-                            # prior EP distribution, so the existing placement is correct.
-                            ignored_params.add(param)
+                            # Plain tensor → rematerialize onto world_mesh as all Replicate.
+                            local_param = param
+                        dist_param = nn.Parameter(
+                            distribute_tensor(
+                                local_param, self.world_mesh, [Replicate() for _ in range(self.world_mesh.ndim)]
+                            ),
+                            requires_grad=param.requires_grad,
+                        )
+                        module.register_parameter(name, dist_param)
+                        ignored_params.add(dist_param)
                         break
 
             for child in module.children():
