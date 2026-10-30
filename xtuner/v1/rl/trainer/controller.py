@@ -4,6 +4,7 @@ from typing import Any, Literal, TypedDict
 
 import ray
 import torch
+from typing_extensions import NotRequired
 
 from xtuner.v1.data_proto.sequence_context import SequenceContext
 from xtuner.v1.model.compose.base import BaseComposeConfig
@@ -22,6 +23,21 @@ class ColateItem(TypedDict):
     shifted_labels: torch.Tensor
     advantage: float
     rollout_logprobs: torch.Tensor | None
+
+
+class PackedBatch(TypedDict):
+    """Output of ``TrainingController._packing``: samples concatenated into one
+    sequence."""
+
+    seq_ctx: SequenceContext
+    shifted_labels: torch.Tensor
+    advantages: torch.Tensor
+    rollout_logprobs: torch.Tensor | None
+    # OPD teacher fields only exist with the distillation path, which this fork
+    # does not have yet.
+    teacher_logprobs: NotRequired[torch.Tensor | None]
+    target_token_ids: NotRequired[torch.Tensor | None]
+    teacher_indices: NotRequired[torch.Tensor | None]
 
 
 def _summarize_process_group_results(results: list[dict[str, Any]]) -> str:
@@ -45,6 +61,25 @@ def _summarize_process_group_results(results: list[dict[str, Any]]) -> str:
     if result_errors:
         summary += f", errors={len(result_errors)}, first_error={result_errors[0]}"
     return summary
+
+
+def _verify_packed_alignment(packed_batch: PackedBatch) -> None:
+    # Position-wise fields must stay aligned with input_ids; a mismatch would silently shift
+    # the element-wise policy loss or crash on shape mismatch in the loss function.
+    assert packed_batch["seq_ctx"].input_ids is not None
+    seq_len = packed_batch["seq_ctx"].input_ids.shape[1]
+    shifted_labels = packed_batch["shifted_labels"]
+    advantages = packed_batch["advantages"]
+    assert shifted_labels.shape[1] == seq_len, f"{shifted_labels.shape[1]} vs {seq_len}"
+    assert advantages.shape[1] == seq_len, f"{advantages.shape[1]} vs {seq_len}"
+    for field_name, optional_field in (
+        ("rollout_logprobs", packed_batch["rollout_logprobs"]),
+        ("teacher_logprobs", packed_batch.get("teacher_logprobs")),
+        ("target_token_ids", packed_batch.get("target_token_ids")),
+        ("teacher_indices", packed_batch.get("teacher_indices")),
+    ):
+        if optional_field is not None:
+            assert optional_field.shape[1] == seq_len, f"{field_name}: {optional_field.shape[1]} vs {seq_len}"
 
 
 class TrainingController:
@@ -172,14 +207,14 @@ class TrainingController:
             if rollout_logprobs_list is not None:
                 rollout_logprobs = torch.cat(rollout_logprobs_list, dim=1)  # (1, max_len)
 
-            packed_data_batches.append(
-                {
-                    "seq_ctx": seq_ctx,
-                    "shifted_labels": shifted_labels,
-                    "advantages": advantages,
-                    "rollout_logprobs": rollout_logprobs,
-                }
-            )
+            packed_batch = {
+                "seq_ctx": seq_ctx,
+                "shifted_labels": shifted_labels,
+                "advantages": advantages,
+                "rollout_logprobs": rollout_logprobs,
+            }
+            _verify_packed_alignment(packed_batch)
+            packed_data_batches.append(packed_batch)
         return packed_data_batches
 
     def _grouped_by_max_length(self, packed_data_batches):
