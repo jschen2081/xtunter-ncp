@@ -114,9 +114,9 @@ class ChunkLoss(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_output):
         grad_input, grad_weight = ctx.saved_tensors
-        if torch.ne(grad_output[0], 1.0):
-            grad_input = grad_input * grad_output[0]
-            grad_weight = grad_weight * grad_output[0]
+        # A Python condition on the CUDA scalar would synchronize the host.
+        grad_input = grad_input * grad_output[0]
+        grad_weight = grad_weight * grad_output[0]
 
         return (grad_input, grad_weight, None, None, None, None, None)[: ctx.num_inputs]
 
