@@ -49,6 +49,7 @@ from xtuner.v1.utils import (
     log_rank0,
     profile_time_and_memory,
 )
+from xtuner.v1.utils.activation_offload import OffloadManager
 from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
 from xtuner.v1.utils.grad_norm import cal_grad_norm, cal_grad_norm_from_groups
 
@@ -295,6 +296,13 @@ class TrainEngine:
                 model = cast(Any, self.model)
                 model.set_requires_gradient_sync(True)
                 model.set_reshard_after_backward(True)
+            # Saved-tensor offload is scoped to one complete optimizer step. All
+            # microbatch backwards are done inside this scope, so no saved
+            # activation is needed afterwards; the scope exit is also the only
+            # point where it is safe to wait for the offload copy streams before
+            # dropping their references. `finally` guarantees the release even
+            # when backward raises (OOM retry, NaN abort, ...).
+            OffloadManager().clear_step()
 
         batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
         return TrainStepInfo(total_loss=total_loss.item(), **data_batch_info, **batch_forward_info)
