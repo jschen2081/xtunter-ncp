@@ -252,11 +252,15 @@ class MuonConfig(OptimConfig):
                     explicit_adamw_params.setdefault(options["weight_decay"], []).append(p)
                     num_adamw += n
                     continue
-                # we want to avoid using Muon for 1D-tensors, as well as embed_tokens and lm_head.
-                # effectively-1D tensors where one dimension accounts for all elements (e.g. shape [1, D]) should
-                # also be excluded, and hence the `p.numel() not in p.shape` condition.
+                # Muon only applies to 2D matrices; 3D tensors (e.g. GatedDeltaNet depthwise
+                # conv1d [C, 1, K]) and 1D tensors use AdamW, matching Megatron and Automodel.
+                # Flattening a degenerate 3D tensor explodes the spectral-norm lr ratio
+                # (observed x45 on Qwen3.5 conv1d, root cause of the step-10 grad_norm spike).
+                # effectively-1D tensors where one dimension accounts for all elements
+                # (e.g. shape [1, D]) should also be excluded, and hence the
+                # `p.numel() not in p.shape` condition.
                 is_muon_tensor = (
-                    p.ndim >= 2 and "embed_tokens" not in name and "lm_head" not in name and p.numel() not in p.shape
+                    p.ndim == 2 and "embed_tokens" not in name and "lm_head" not in name and p.numel() not in p.shape
                 )
                 if is_muon_tensor:
                     if is_moe_model and any(pattern in name for pattern in fused_w1w3_patterns):
