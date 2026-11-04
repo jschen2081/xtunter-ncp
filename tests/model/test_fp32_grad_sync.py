@@ -148,8 +148,14 @@ def _check_hsdp_rank(rank: int, rendezvous: str) -> None:
         assert prototype.world_mesh.mesh_dim_names == ("default.hsdp_replicate", "default.hsdp_shard")
         for kind in ("gdn", "kda"):
             model, ignored = _model("moe", kind, prototype.world_mesh, 1)
+            # HSDP has already averaged FSDP-managed gradients across replicas
+            # during backward. Only the ignored world replicas need manual sync.
+            model.control = nn.Parameter(
+                distribute_tensor(torch.ones(4), prototype.world_mesh, [Replicate(), Shard(0)])
+            )
             materialize = dtensor_to_local if kind == "gdn" else dtensor_full_tensor
-            sum(materialize(parameter).sum() * (rank + 1) for parameter in ignored.values()).backward()
+            loss = sum(materialize(parameter).sum() * (rank + 1) for parameter in ignored.values())
+            (loss + model.control.to_local().sum() * 2.5).backward()
             calls = []
             original_all_reduce = dist.all_reduce
 
@@ -163,6 +169,7 @@ def _check_hsdp_rank(rank: int, rendezvous: str) -> None:
                 assert parameter.device_mesh is prototype.world_mesh
                 torch.testing.assert_close(parameter.grad.to_local(), torch.full((4,), 2.5))
             assert calls == [4] * len(ignored)
+            torch.testing.assert_close(model.control.grad.to_local(), torch.full((2,), 2.5))
         dist.barrier()
     finally:
         dist.destroy_process_group()

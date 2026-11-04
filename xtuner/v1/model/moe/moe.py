@@ -1529,8 +1529,15 @@ class MoE(BaseModel):
             if not isinstance(param, DTensor):
                 continue
 
+            # FSDP2 already reduces its managed gradients across HSDP replicas
+            # during backward. Ignored FP32 parameters have only Replicate
+            # placements and still require the manual full-world mean below.
+            fsdp_managed = any(isinstance(placement, Shard) for placement in param.placements)
             replicate_dim_names = tuple(
-                param.device_mesh.mesh_dim_names[i] for i, p in enumerate(param.placements) if isinstance(p, Replicate)
+                param.device_mesh.mesh_dim_names[i]
+                for i, p in enumerate(param.placements)
+                if isinstance(p, Replicate)
+                and not (fsdp_managed and param.device_mesh.mesh_dim_names[i].endswith("hsdp_replicate"))
             )
             if not replicate_dim_names:
                 continue
