@@ -118,12 +118,15 @@ class Qwen3_5_VLTextMoESplit(MoE):
 class Qwen3_5_VLTextMoESplitConfig(MoEConfig):
     with_shared_expert_gate: bool = True
     rms_norm_type: Literal["default", "zero_centered"] = "zero_centered"
+    # Keep GDN decay parameters in FP32 during FSDP forward and HF export.
     hf_save_cfg: HFSaveCfg = HFSaveCfg(
         fp32_keys_pattern=[
             r"model(?:\.language_model)?\.layers\.\d+\.linear_attn\.norm\.weight",
             r"model(?:\.language_model)?\.layers\.\d+\.linear_attn\.A_log",
+            r"model(?:\.language_model)?\.layers\.\d+\.linear_attn\.dt_bias",
             r"^mtp\.layers\.\d+\.linear_attn\.norm\.weight$",
             r"^mtp\.layers\.\d+\.linear_attn\.A_log$",
+            r"^mtp\.layers\.\d+\.linear_attn\.dt_bias$",
         ],
     )
 
