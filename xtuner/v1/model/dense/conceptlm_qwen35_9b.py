@@ -528,6 +528,7 @@ class ConceptLMQwen35V2Config(Qwen3_5_VLTextDense9BConfig):
     hf_save_cfg: HFSaveCfg = HFSaveCfg(
         fp32_keys_pattern=[
             r"model\.(?:encoder|predictor|decoder)\.layers\.\d+\.attention\.A_log",
+            r"model\.(?:encoder|predictor|decoder)\.layers\.\d+\.attention\.dt_bias",
             r"model\.(?:encoder|predictor|decoder)\.layers\.\d+\.attention\.conv1d\.weight",
         ],
     )
