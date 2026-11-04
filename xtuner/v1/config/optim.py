@@ -174,6 +174,10 @@ class MuonConfig(OptimConfig):
         float | None,
         Parameter(help="Weight decay for embedding parameters. None uses weight_decay."),
     ] = None
+    lm_head_weight_decay: Annotated[
+        float | None,
+        Parameter(help="Weight decay for LM head parameters in the AdamW group. None uses weight_decay."),
+    ] = None
     one_d_weight_decay: Annotated[
         float | None,
         Parameter(help="Weight decay for 1D / bias parameters in the AdamW group. None uses weight_decay."),
@@ -281,7 +285,9 @@ class MuonConfig(OptimConfig):
                 else:
                     is_embed = "embed_tokens" in name or name.endswith("embeddings.weight")
                     is_1d = p.ndim < 2 or p.numel() in p.shape
-                    if self.embedding_weight_decay is not None and is_embed:
+                    if self.lm_head_weight_decay is not None and "lm_head" in name:
+                        explicit_adamw_params.setdefault(self.lm_head_weight_decay, []).append(p)
+                    elif self.embedding_weight_decay is not None and is_embed:
                         adamw_embed_params.append(p)
                     elif self.one_d_weight_decay is not None and is_1d:
                         adamw_1d_params.append(p)
