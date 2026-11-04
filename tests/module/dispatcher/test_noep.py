@@ -1,8 +1,9 @@
 from unittest import TestCase
 
-import torch
-from xtuner.v1.module.dispatcher.base import NaiveDispatcher
 import parametrize
+import torch
+
+from xtuner.v1.module.dispatcher.base import NaiveDispatcher
 
 
 def mock_experts(hidden_states: torch.Tensor, tokens_per_exprts: torch.Tensor):
@@ -16,8 +17,14 @@ class TestNoEPDispatcher(TestCase):
             n_routed_experts=n_routed_experts,
         )
 
-    @parametrize.parametrize("dtype,device", [(torch.bfloat16, "cuda")])
-    def test_dispatch_and_combine(self, dtype, device):
+    @parametrize.parametrize(
+        "dtype,device,async_op",
+        [
+            (torch.bfloat16, "cuda", False),
+            (torch.bfloat16, "cuda", True),
+        ],
+    )
+    def test_dispatch_and_combine(self, dtype, device, async_op):
         # seq len 16, hidden size 4
         # [0, 1, 2, 3]
         hidden_states = torch.arange(4).unsqueeze(1).to(device).to(dtype).repeat(1, 32)
@@ -37,27 +44,35 @@ class TestNoEPDispatcher(TestCase):
         #   e(h[2]) + e(h[3]), -> 4
         #   e(h[3]) + e(h[0]), -> 6
         # ]
-        target_results = torch.tensor(
-            [
-                [0],
-                [2],
-                [4],
-                [6],
-            ]
-        ).to(device).to(dtype).repeat(1, 32)
+        target_results = (
+            torch.tensor(
+                [
+                    [0],
+                    [2],
+                    [4],
+                    [6],
+                ]
+            )
+            .to(device)
+            .to(dtype)
+            .repeat(1, 32)
+        )
         pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            async_op=async_op,
         )
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
             topk_weights=topk_weights,
             decoding=False,
+            async_op=async_op,
         )
         post_dispatched = self.dispatcher.dispatch_postprocess(
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
+            async_op=async_op,
         )
         experts_results = mock_experts(
             hidden_states=post_dispatched["hidden_states"],
@@ -69,6 +84,7 @@ class TestNoEPDispatcher(TestCase):
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
             post_dispatched=post_dispatched,
+            async_op=async_op,
         )
         combined = self.dispatcher.combine(
             pre_dispatched=pre_dispatched,
@@ -76,6 +92,7 @@ class TestNoEPDispatcher(TestCase):
             post_dispatched=post_dispatched,
             pre_combined=pre_combined,
             decoding=False,
+            async_op=async_op,
         )
         result = self.dispatcher.combine_postprocess(
             pre_dispatched=pre_dispatched,
@@ -83,5 +100,6 @@ class TestNoEPDispatcher(TestCase):
             post_dispatched=post_dispatched,
             pre_combined=pre_combined,
             combined=combined,
+            async_op=async_op,
         )
         self.assertTrue(torch.equal(result["hidden_states"], target_results))
