@@ -1688,6 +1688,10 @@ class MoE(BaseModel):
                 ),
             )
             self.fsdp_mesh = self.hsdp_mesh[f"{self.config.mesh_prefix}.hsdp_shard"]
+            # FP32 parameters ignored by FSDP must replicate over this named
+            # world mesh, including both HSDP dimensions. Otherwise BaseModel
+            # lazily creates an unnamed mesh that MoE gradient reduction cannot index.
+            self._world_mesh = self.hsdp_mesh
 
     def _replicate_other_params(self, model: nn.Module):
         def traverse(module: nn.Module) -> None:
