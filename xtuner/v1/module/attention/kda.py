@@ -347,7 +347,7 @@ class KimiDeltaAttention(nn.Module):
         g = _all_to_all_g(g, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
         g = g.transpose(1, 2).view(batch_size, seq_len * sp_size, self.num_heads // sp_size, self.head_dim)
 
-        beta = self.b_proj(hidden_states).float().transpose(1, 2)  # (B, H, L/sp)
+        beta = self.b_proj(hidden_states).float().sigmoid().transpose(1, 2)  # (B, H, L/sp)
         beta = _all_to_all_beta(beta, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
         beta = beta.transpose(1, 2)  # (B, L, H/sp)
 
@@ -375,7 +375,6 @@ class KimiDeltaAttention(nn.Module):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
             safe_gate=self.gate_lower_bound is not None,
             lower_bound=self.gate_lower_bound,
             state_v_first=True,
@@ -435,7 +434,7 @@ class KimiDeltaAttention(nn.Module):
 
         g = self.f_b_proj(self.f_a_proj(hidden_states))
         g = g.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        beta = self.b_proj(hidden_states).float()
+        beta = self.b_proj(hidden_states).float().sigmoid()
 
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -453,7 +452,6 @@ class KimiDeltaAttention(nn.Module):
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
             safe_gate=self.gate_lower_bound is not None,
             lower_bound=self.gate_lower_bound,
             state_v_first=True,
