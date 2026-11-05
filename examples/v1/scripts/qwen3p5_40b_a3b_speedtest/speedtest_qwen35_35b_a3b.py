@@ -1,6 +1,9 @@
 """Qwen3.5-35B-A3B speedtest with OLMo indexed tokens and mixed Muon/AdamW.
 
 Data loading follows jyhuang/conceptlm-moe-stable at b07c9e9a.
+
+For the full no-EP 8192-token benchmark on 140 GiB H200 GPUs, enable local
+expert packing with INTRA_LAYER_MICRO_BATCH=2 and RECOMPUTE_RATIO=0.75.
 """
 
 import os
@@ -25,8 +28,7 @@ work_dir = Path(os.environ["WORK_DIR"])
 seq_len = int(os.environ.get("SEQ_LEN", "8192"))
 global_batch_size = int(os.environ.get("GLOBAL_BATCH_SIZE", "4096"))
 # This groups sequence contexts inside each layer, not a dense batch dimension.
-# The vanilla grouped_gemm EP=TP=1 path processes one context at a time.
-intra_layer_micro_batch = 1
+intra_layer_micro_batch = int(os.environ.get("INTRA_LAYER_MICRO_BATCH", "1"))
 world_size = int(os.environ.get("WORLD_SIZE", "8"))
 total_step = int(os.environ.get("TOTAL_STEP", "100"))
 lr = float(os.environ.get("LR", "1e-4"))
@@ -35,7 +37,7 @@ lr_min_ratio = float(os.environ.get("LR_MIN_RATIO", "0.1"))
 model_compile = _bool_env("MODEL_COMPILE", False)
 recompute_ratio = float(os.environ.get("RECOMPUTE_RATIO", "0.0"))
 profile_steps = [int(step) for step in os.environ.get("PROFILE_STEP", "").split(",") if step.strip()]
-if min(global_batch_size, world_size, total_step) < 1 or seq_len < 2:
+if min(global_batch_size, world_size, total_step, intra_layer_micro_batch) < 1 or seq_len < 2:
     raise ValueError("Batch sizes, world size, and steps must be positive; SEQ_LEN must be >= 2")
 if lr <= 0 or not 0 <= lr_min_ratio <= 1:
     raise ValueError("LR must be positive and LR_MIN_RATIO must be between 0 and 1")
@@ -43,6 +45,8 @@ if not 0 <= lr_warmup_steps < total_step:
     raise ValueError("LR_WARMUP_STEPS must be nonnegative and smaller than TOTAL_STEP")
 if global_batch_size % world_size:
     raise ValueError("GLOBAL_BATCH_SIZE must be divisible by WORLD_SIZE (SP=TP=EP=1)")
+if (global_batch_size // world_size) % intra_layer_micro_batch:
+    raise ValueError("GLOBAL_BATCH_SIZE / WORLD_SIZE must be divisible by INTRA_LAYER_MICRO_BATCH")
 if not 0 <= recompute_ratio <= 1:
     raise ValueError("RECOMPUTE_RATIO must be between 0 and 1")
 if any(step < 0 or step >= total_step for step in profile_steps):
@@ -74,12 +78,13 @@ trainer = TrainerConfig(
                 "tokenize_fn": PretrainTokenizeFunctionConfig(),
             }
         ],
-        # The indexed reader supplies exact L+1 blocks; do not repack or pad.
+        # Exact indexed L+1 blocks need no repacking. This collator shifts to L
+        # without padding while satisfying the trainer's fixed-shape compile check.
         pack_level="none",
         pack_max_length=seq_len + 1,
-        pack_to_max_length=False,
+        pack_to_max_length=True,
         group_by_length=False,
-        collator="sft_llm_collator",
+        collator="single_sequence_sft_llm_collator",
         num_workers=2,
     ),
     # Native MuonConfig routes embeddings, LM head, norms, biases and conv1d to AdamW.

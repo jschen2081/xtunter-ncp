@@ -30,9 +30,9 @@ def test_speedtest_uses_unpacked_indexed_tokens_and_scalar_moe_path(
     assert dataset.sequence_length == 8193
     assert dataloader.pack_level == "none"
     assert dataloader.pack_max_length == 8193
-    assert not dataloader.pack_to_max_length
+    assert dataloader.pack_to_max_length
     assert not dataloader.group_by_length
-    assert dataloader.collator == "sft_llm_collator"
+    assert dataloader.collator == "single_sequence_sft_llm_collator"
     assert trainer.model_cfg.ep_size == 1
     assert trainer.model_cfg.dispatcher is None
     assert trainer.model_cfg.expert_backend == "grouped_gemm"
@@ -40,6 +40,11 @@ def test_speedtest_uses_unpacked_indexed_tokens_and_scalar_moe_path(
     assert trainer.fsdp_cfg.ep_size == 1
     assert trainer.sp_size == 1
     assert trainer.intra_layer_micro_batch == 1
+    assert not trainer.model_cfg.compile_cfg
+    assert trainer.fsdp_cfg.recompute_ratio == 0.0
+    assert trainer.fsdp_cfg.reshard_after_forward
+    assert not trainer.fsdp_cfg.gradient_accumulation_no_sync
+    assert trainer.loss_cfg.chunk_size == 128
 
     source_tokens = list(range(8193))
     batch = dataloader.build_collator()(
@@ -57,3 +62,22 @@ def test_speedtest_uses_unpacked_indexed_tokens_and_scalar_moe_path(
     assert batch[0]["shifted_labels"].tolist() == [source_tokens[1:]]
     assert seq_ctx.cu_seq_lens_q.tolist() == [0, 8192]
     assert seq_ctx.num_padding == 0
+
+
+def test_speedtest_microbatch_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("DATA_PATH", str(tmp_path / "data_args_path.txt"))
+    monkeypatch.setenv("TOKENIZER_PATH", str(tmp_path / "tokenizer"))
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("GLOBAL_BATCH_SIZE", "16")
+    monkeypatch.setenv("TOTAL_STEP", "3")
+    monkeypatch.setenv("LR_WARMUP_STEPS", "2")
+    monkeypatch.setenv("INTRA_LAYER_MICRO_BATCH", "2")
+
+    trainer = runpy.run_path(str(RECIPE))["trainer"]
+
+    assert trainer.intra_layer_micro_batch == 2
+
+    monkeypatch.setenv("GLOBAL_BATCH_SIZE", "24")
+    with pytest.raises(ValueError, match="divisible by INTRA_LAYER_MICRO_BATCH"):
+        runpy.run_path(str(RECIPE))

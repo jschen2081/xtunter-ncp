@@ -520,9 +520,9 @@ class MoEDecoderLayer(nn.Module):
     ) -> MoEDecoderLayerOutput | MoEDecoderLayerMicroBatchOutput:
         """Forward pass of the MoE decoder layer.
 
-        Passing lists runs several equal-shaped micro-batches in one layer invocation (domino EP),
-        so that the expert dispatch/combine communication of one micro-batch overlaps the expert
-        compute of another.
+        Passing lists runs several equal-shaped micro-batches in one layer invocation (domino EP).
+        ExpertTP overlaps dispatch/combine communication with expert compute; the local BF16 NaiveDispatcher
+        instead concatenates tokens and invokes routed experts once.
 
         Args:
             hidden_states (torch.Tensor | list[torch.Tensor]): Input hidden states, one tensor per
@@ -759,6 +759,14 @@ class MoEDecoderLayer(nn.Module):
             )
 
         assert self.dispatcher is not None
+        if self.dispatcher.supports_micro_batch_pack:
+            return self._local_packed_micro_batch_forward(
+                hidden_states_list=hidden_states_list,
+                seq_ctx_list=seq_ctx_list,
+                position_embeddings_list=position_embeddings_list,
+                attention_kwargs_list=attention_kwargs_list,
+            )
+
         origin_shape = hidden_states_list[0].shape
         assert all(hidden_states.shape == origin_shape for hidden_states in hidden_states_list), (
             "All hidden states should have the same shape"
@@ -890,6 +898,139 @@ class MoEDecoderLayer(nn.Module):
             )
             pre_shape = pre_moe_forward_out_list[i].shape
             combined_hidden_states = post_combined["hidden_states"].view(pre_shape[0], pre_shape[1], -1)
+            combined_hidden_states = self._project_from_experts(combined_hidden_states)
+            hidden_states = self._post_moe_forward(
+                combined_hidden_states=combined_hidden_states,
+                residual=residual_list[i],
+                shared_experts_out=shared_experts_out_list[i],
+            )
+            hidden_states_out_list.append(hidden_states)
+
+        return self._build_micro_batch_output(
+            hidden_states_list=hidden_states_out_list,
+            router_results_list=router_results_list,
+            attn_outputs_list=attn_outputs_list,
+        )
+
+    def _local_packed_micro_batch_forward(
+        self,
+        hidden_states_list: list[torch.Tensor],
+        seq_ctx_list: list[SequenceContext],
+        position_embeddings_list: list[tuple[torch.Tensor, torch.Tensor]],
+        attention_kwargs_list: list[dict[str, object]] | None = None,
+    ) -> MoEDecoderLayerMicroBatchOutput:
+        """Run routed experts once over the concatenated local micro-batch
+        tokens."""
+        origin_shape = hidden_states_list[0].shape
+        assert all(hidden_states.shape == origin_shape for hidden_states in hidden_states_list), (
+            "All hidden states should have the same shape"
+        )
+        if attention_kwargs_list is None:
+            attention_kwargs_list = [{} for _ in hidden_states_list]
+        assert len(attention_kwargs_list) == len(hidden_states_list)
+
+        residual_list: list[torch.Tensor] = []
+        router_results_list: list[RouterResults] = []
+        attn_outputs_list: list[AttnOutputs] = []
+        pre_moe_forward_out_list: list[torch.Tensor] = []
+        expert_inputs: list[torch.Tensor] = []
+        topk_ids_list: list[torch.Tensor] = []
+        topk_weights_list: list[torch.Tensor] = []
+
+        for hidden_states, attention_kwargs, seq_ctx, position_embeddings in zip(
+            hidden_states_list,
+            attention_kwargs_list,
+            seq_ctx_list,
+            position_embeddings_list,
+        ):
+            residual, hidden_states, router_results, attn_outputs = self._pre_moe_forward(
+                hidden_states=hidden_states,
+                seq_ctx=seq_ctx,
+                position_embeddings=position_embeddings,
+                state=ForwardState.TRAINING,
+                attention_kwargs=attention_kwargs,
+            )
+            pre_moe_forward_out_list.append(hidden_states)
+            expert_in = self._project_to_experts(hidden_states)
+            expert_inputs.append(expert_in.view(-1, expert_in.shape[-1]))
+            topk_ids_list.append(router_results["topk_ids"].reshape(-1, router_results["topk_ids"].shape[-1]))
+            topk_weights_list.append(
+                router_results["topk_weights"].reshape(-1, router_results["topk_weights"].shape[-1])
+            )
+            residual_list.append(residual)
+            router_results_list.append(router_results)
+            attn_outputs_list.append(attn_outputs)
+
+        token_counts = [expert_in.shape[0] for expert_in in expert_inputs]
+        expert_in = torch.cat(expert_inputs, dim=0)
+        topk_ids = torch.cat(topk_ids_list, dim=0)
+        topk_weights = torch.cat(topk_weights_list, dim=0)
+        assert topk_ids.shape == topk_weights.shape
+        assert topk_ids.shape[0] == expert_in.shape[0]
+
+        assert self.dispatcher is not None
+        pre_dispatched = self.dispatcher.dispatch_preprocess(
+            hidden_states=expert_in,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            async_op=False,
+        )
+        dispatched = self.dispatcher.dispatch(
+            pre_dispatched=pre_dispatched,
+            topk_weights=topk_weights,
+            async_op=False,
+            decoding=False,
+        )
+        post_dispatched = self.dispatcher.dispatch_postprocess(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            async_op=False,
+        )
+        if self.ep_mesh is not None:
+            torch._dynamo.mark_dynamic(post_dispatched["hidden_states"], 0)
+        experts_out = self.experts(
+            post_dispatched["hidden_states"],
+            post_dispatched["tokens_per_expert"],
+            decoding=False,
+        )
+        pre_combined = self.dispatcher.combine_preprocess(
+            hidden_states=experts_out,
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            async_op=False,
+            decoding=False,
+        )
+        combined = self.dispatcher.combine(
+            pre_combined=pre_combined,
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            async_op=False,
+            decoding=False,
+        )
+        post_combined = self.dispatcher.combine_postprocess(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            pre_combined=pre_combined,
+            combined=combined,
+            async_op=False,
+        )
+        combined_hidden_states_list = torch.split(post_combined["hidden_states"], token_counts, dim=0)
+
+        shared_experts_out_list: list[torch.Tensor | None]
+        if self.n_shared_experts > 0:
+            shared_experts_out_list = [
+                self._shared_experts_forward(hidden_states=hidden_states) for hidden_states in pre_moe_forward_out_list
+            ]
+        else:
+            shared_experts_out_list = [None] * len(hidden_states_list)
+
+        hidden_states_out_list: list[torch.Tensor] = []
+        for i, combined_hidden_states in enumerate(combined_hidden_states_list):
+            pre_shape = pre_moe_forward_out_list[i].shape
+            combined_hidden_states = combined_hidden_states.view(pre_shape[0], pre_shape[1], -1)
             combined_hidden_states = self._project_from_experts(combined_hidden_states)
             hidden_states = self._post_moe_forward(
                 combined_hidden_states=combined_hidden_states,

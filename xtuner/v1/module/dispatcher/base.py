@@ -110,6 +110,10 @@ class GenericDispatcher(
         self._training_dtype = training_dtype
         self._generate_dtype = generate_dtype
 
+    @property
+    def supports_micro_batch_pack(self) -> bool:
+        return False
+
     @abstractmethod
     def dispatch(
         self,
@@ -251,6 +255,11 @@ class NaiveDispatcher(
         self._expert_tp = ExpertTP(tp_group) if tp_group is not None and tp_group.size() > 1 else None
         if self._expert_tp is not None and NaiveDispatcher._comm_stream is None:
             NaiveDispatcher._comm_stream = torch.cuda.Stream()
+
+    @property
+    @override
+    def supports_micro_batch_pack(self) -> bool:
+        return self._expert_tp is None and self._training_dtype == "bf16"
 
     @override
     def dispatch_preprocess(

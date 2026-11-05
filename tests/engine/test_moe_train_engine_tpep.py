@@ -676,6 +676,10 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         ],
     )
     def test_naive_dispatcher_domino_micro_batch_matches_sync_baseline(self, device: str, expert_tp_size: int) -> None:
+        from unittest.mock import patch
+
+        from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEBlock
+
         pg = self.create_pg(device)
 
         engine_ref = _build_engine(ep_size=1, expert_tp_size=expert_tp_size)
@@ -698,12 +702,27 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         ]
         _assert_rank_inputs_are_distinct(batches)
         loss_cfg = CELossConfig()
+        original_expert_forward = MoEBlock.forward
 
-        loss_domino = _run_train_step_items_without_clip(engine_domino, loss_cfg, batches)
+        def run_with_expert_call_count(engine):
+            expert_calls = 0
+
+            def counted_expert_forward(self, *args, **kwargs):
+                nonlocal expert_calls
+                expert_calls += 1
+                return original_expert_forward(self, *args, **kwargs)
+
+            with patch.object(MoEBlock, "forward", counted_expert_forward):
+                loss = _run_train_step_items_without_clip(engine, loss_cfg, batches)
+            return loss, expert_calls
+
+        loss_domino, calls_domino = run_with_expert_call_count(engine_domino)
         norm_domino = engine_domino.clip_grad_norm(do_clip=False).detach().float().cpu()
 
-        loss_ref = _run_train_step_items_without_clip(engine_ref, loss_cfg, batches)
+        loss_ref, calls_ref = run_with_expert_call_count(engine_ref)
         norm_ref = engine_ref.clip_grad_norm(do_clip=False).detach().float().cpu()
+        assert calls_ref > 0
+        assert calls_domino * (2 if expert_tp_size == 1 else 1) == calls_ref, (calls_domino, calls_ref)
 
         if collective_stages is not None:
             _assert_domino_expert_tp_collective_stages(collective_stages)
@@ -721,6 +740,29 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         )
         assert torch.isfinite(torch.tensor(loss_domino))
         assert torch.isfinite(norm_domino)
+
+        if expert_tp_size == 1:
+
+            def expert_grads(engine):
+                grads = {}
+                for name, param in engine.model.named_parameters():
+                    if "experts.fused_w" not in name or param.grad is None:
+                        continue
+                    grad = param.grad.full_tensor() if isinstance(param.grad, DTensor) else param.grad
+                    grads[name] = grad.detach().float().cpu()
+                return grads
+
+            grads_domino = expert_grads(engine_domino)
+            grads_ref = expert_grads(engine_ref)
+            assert grads_domino.keys() == grads_ref.keys()
+            assert grads_domino
+            for name in grads_domino:
+                torch.testing.assert_close(
+                    grads_domino[name],
+                    grads_ref[name],
+                    atol=BF16_GEMM_ATOL,
+                    rtol=BF16_GEMM_RTOL,
+                )
 
         dist.barrier()
         torch.cuda.empty_cache()
