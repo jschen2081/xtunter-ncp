@@ -671,10 +671,11 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
     @parametrize.parametrize(
         "device,expert_tp_size",
         [
+            ("cuda", 1),
             ("cuda", 2),
         ],
     )
-    def test_expert_tp_only_domino_micro_batch_matches_sync_baseline(self, device: str, expert_tp_size: int) -> None:
+    def test_naive_dispatcher_domino_micro_batch_matches_sync_baseline(self, device: str, expert_tp_size: int) -> None:
         pg = self.create_pg(device)
 
         engine_ref = _build_engine(ep_size=1, expert_tp_size=expert_tp_size)
@@ -687,7 +688,7 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         )
         engine_domino.init_model_weights()
         _copy_matching_engine_weights(engine_ref, engine_domino)
-        collective_stages = _record_expert_tp_collective_stages(engine_domino)
+        collective_stages = _record_expert_tp_collective_stages(engine_domino) if expert_tp_size > 1 else None
         dist.barrier()
 
         device_obj = torch.device(device, dist.get_rank() % torch.cuda.device_count())
@@ -704,7 +705,8 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         loss_ref = _run_train_step_items_without_clip(engine_ref, loss_cfg, batches)
         norm_ref = engine_ref.clip_grad_norm(do_clip=False).detach().float().cpu()
 
-        _assert_domino_expert_tp_collective_stages(collective_stages)
+        if collective_stages is not None:
+            _assert_domino_expert_tp_collective_stages(collective_stages)
         torch.testing.assert_close(
             torch.tensor(loss_domino),
             torch.tensor(loss_ref),

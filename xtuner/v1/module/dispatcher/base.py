@@ -261,10 +261,10 @@ class NaiveDispatcher(
         topk_weights: torch.Tensor,
         async_op: bool = False,
     ) -> NaivePreDispatchResult:
+        # With no ExpertTP there is no communication to overlap. The micro-batch
+        # layer still requests async dispatch, so use the ordinary local path.
+        async_op = async_op and self._expert_tp is not None
         if async_op:
-            if self._expert_tp is None:
-                raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")
-
             forward_finished_event = torch.cuda.Event()
             forward_finished_event.record()
             backward_previous_event = torch.cuda.Event()
@@ -294,10 +294,9 @@ class NaiveDispatcher(
         async_op: bool = False,
         decoding: bool = False,
     ) -> NaiveDispatchResult:
+        async_op = async_op and self._expert_tp is not None
         if async_op:
-            if self._expert_tp is None:
-                raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")
-
+            assert self._expert_tp is not None
             forward_previous_event = pre_dispatched["forward_finished_event"]
             backward_finished_event = pre_dispatched["backward_previous_event"]
             assert forward_previous_event is not None, "Use async_op=True for dispatch_preprocess!"
@@ -383,9 +382,8 @@ class NaiveDispatcher(
         async_op: bool = False,
         decoding: bool = False,
     ) -> NaivePostDispatchResult:
+        async_op = async_op and self._expert_tp is not None
         if async_op:
-            if self._expert_tp is None:
-                raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")
             forward_finished_event = dispatched["forward_finished_event"]
             assert forward_finished_event is not None, "Use async_op=True for dispatch!"
             torch.cuda.current_stream().wait_event(forward_finished_event)
@@ -422,9 +420,9 @@ class NaiveDispatcher(
         async_op: bool = False,
         decoding: bool = False,
     ) -> NaivePreCombineResult:
+        async_op = async_op and self._expert_tp is not None
         if async_op:
-            if self._expert_tp is None:
-                raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")
+            assert self._expert_tp is not None
 
         hidden_states = unpermute(
             input_act=hidden_states,
@@ -464,9 +462,9 @@ class NaiveDispatcher(
         async_op: bool = False,
         decoding: bool = False,
     ) -> NaiveCombineResult:
+        async_op = async_op and self._expert_tp is not None
         if async_op:
-            if self._expert_tp is None:
-                raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")
+            assert self._expert_tp is not None
 
         if decoding:
             raise NotImplementedError
@@ -523,9 +521,8 @@ class NaiveDispatcher(
         combined: NaiveCombineResult,
         async_op: bool = False,
     ) -> PostCombineResult:
+        async_op = async_op and self._expert_tp is not None
         if async_op:
-            if self._expert_tp is None:
-                raise NotImplementedError("Naive dispatcher async_op=True requires ExpertTP.")
             forward_finished_event = combined["forward_finished_event"]
             backward_previous_event = combined["backward_previous_event"]
             assert forward_finished_event is not None, "Use async_op=True for combine!"
