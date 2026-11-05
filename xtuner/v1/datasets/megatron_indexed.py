@@ -75,7 +75,9 @@ class MegatronIndexedDataset(torch.utils.data.Dataset[DataItem]):
         anno_path (str | Path): Dataset prefix, optionally ending in ``.bin`` or ``.idx``.
         sample_ratio (float): Sampling ratio. Only 1.0 is currently supported.
         name (str): Dataset name.
-        sequence_length (int | None): Fixed block length. When set, the token file is read as one continuous stream.
+        sequence_length (int | None): Fixed source-token block length for reading the token file as one continuous
+            stream. Adjacent blocks overlap by one token. Causal SFT collators consume one source token, so set this
+            to the target model sequence length plus one.
     """
 
     def __init__(

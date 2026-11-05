@@ -112,6 +112,12 @@ def sft_llm_collator(
     pack_to_max_length: bool = True,
     pad_chunk_size: int = 256,
 ) -> list[ColateItem]:
+    """Build causal LM inputs and targets from source token packs.
+
+    ``pack_max_length`` counts source tokens before causal shifting. A source pack of L tokens produces L-1 model
+    inputs and targets, so source lengths should be the target model sequence length plus one. Optional padding is
+    applied after the shift, with ``IGNORE_INDEX`` assigned to padded targets.
+    """
     ret: list[ColateItem] = []
     for instance in instances:
         # If the token number of the packed sample is larger than the packed_max_length
