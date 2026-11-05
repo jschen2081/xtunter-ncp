@@ -2,12 +2,19 @@
 
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from pydantic import ValidationError
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor, Replicate
 
+from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.dense.conceptlm_qwen35_9b import (
     ConceptLMQwen35V2Config,
@@ -452,3 +459,137 @@ def test_v2_default_compile_supports_forward_and_backward(monkeypatch: pytest.Mo
     for parameter in model.parameters():
         if parameter.grad is not None:
             assert torch.isfinite(parameter.grad).all()
+
+
+def _check_ncp_dt_bias_fp32(rank: int, rendezvous: str) -> None:
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=8, timeout=timedelta(seconds=180))
+    try:
+        device = torch.device("cuda", rank)
+        with torch.device("meta"):
+            model = _TinyV2Config(compile_cfg=False).build()
+        model = model.fully_shard(
+            FSDPConfig(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                recompute_ratio=0.0,
+                torch_compile=False,
+            )
+        )
+        torch.manual_seed(rank)
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                local_param = param.to_local() if isinstance(param, DTensor) else param
+                if name.endswith("dt_bias"):
+                    local_param.fill_(-2.0)
+                elif name.endswith("A_log"):
+                    local_param.zero_()
+                else:
+                    local_param.normal_(mean=0.0, std=0.02)
+
+        dt_bias_params = {name: param for name, param in model.named_parameters() if name.endswith("dt_bias")}
+        assert len(dt_bias_params) == 5
+        assert {name.split(".", 1)[0] for name in dt_bias_params} == {"encoder", "predictor", "decoder"}
+        for name, param in dt_bias_params.items():
+            assert name in model._fsdp_ignored_param_names, name
+            assert isinstance(param, DTensor), name
+            assert param.dtype == torch.float32, (name, param.dtype)
+            assert param.device_mesh == model.world_mesh, name
+            assert all(isinstance(placement, Replicate) for placement in param.placements), name
+            hf_keys = model.load_spec_mapping[name].global_hf_keys
+            assert hf_keys == [f"model.{name.replace('.self_attn.', '.attention.')}"]
+            assert all(model._get_save_dtype(key, torch.bfloat16) == torch.float32 for key in hf_keys)
+
+        observed = {}
+
+        def observe_gdn(module, args, output):
+            projection = module.in_proj.weight
+            if isinstance(projection, DTensor):
+                projection = projection.full_tensor()
+            observed["dtypes"] = (module.dt_bias.to_local().dtype, projection.dtype)
+
+        handle = model.encoder.layers["0"].self_attn.register_forward_hook(observe_gdn)
+        ids = torch.arange(17, device=device, dtype=torch.long).remainder(model.config.vocab_size).unsqueeze(0)
+        seq_ctx = SequenceContext.from_input_ids(input_ids=(ids[:, :-1],), device=device)
+        loss_ctx = model.build_loss_ctx_batch([{"seq_ctx": seq_ctx, "shifted_labels": ids[:, 1:]}])[0]
+        outputs = model(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
+        handle.remove()
+        assert observed["dtypes"] == (torch.float32, torch.bfloat16), observed
+        loss = outputs.loss
+        assert loss is not None
+        assert torch.isfinite(loss)
+        loss = loss.float() * (rank + 1)
+        loss.backward()
+
+        local_grads = {}
+        for name, param in dt_bias_params.items():
+            assert param.grad is not None, name
+            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+            assert grad.dtype == torch.float32, (name, grad.dtype)
+            local_grads[name] = grad.detach().clone()
+        model.scale_and_reduce_grad()
+
+        for name, param in dt_bias_params.items():
+            local_grad = local_grads[name]
+            rank_grads = [torch.empty_like(local_grad) for _ in range(8)]
+            dist.all_gather(rank_grads, local_grad)
+            expected = torch.stack(rank_grads).double().mean(dim=0).float()
+            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+            torch.testing.assert_close(grad, expected, rtol=1e-6, atol=1e-9)
+            reduced_grads = [torch.empty_like(grad) for _ in range(8)]
+            dist.all_gather(reduced_grads, grad)
+            for reduced_grad in reduced_grads:
+                torch.testing.assert_close(reduced_grad, grad, rtol=0, atol=0)
+        dist.barrier()
+        if rank == 0:
+            print("PASS: NCP V2 FP32 dt_bias forward and global gradient mean on eight ranks", flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
+class TestNCPDtBiasFP32:
+    def test_fp32_registration_and_hf_export(self) -> None:
+        with torch.device("meta"):
+            model = _TinyV2Config(compile_cfg=False).build()
+        model._world_mesh = Mock(ndim=1)
+        with (
+            patch("xtuner.v1.model.base.fully_shard") as shard,
+            patch("xtuner.v1.model.base.distribute_tensor", side_effect=lambda tensor, *_: tensor),
+        ):
+            model._fully_shard(
+                mesh=model.world_mesh,
+                mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
+                reshard_after_forward=True,
+                offload_policy=None,
+            )
+        ignored = shard.call_args.kwargs["ignored_params"]
+        assert ignored is not None
+        dt_bias_names = {name for name, _ in model.named_parameters() if name.endswith("dt_bias")}
+        assert len(dt_bias_names) == 5
+        projection_count = 0
+        for name, param in model.named_parameters():
+            if name in dt_bias_names:
+                assert name in model._fsdp_ignored_param_names
+                assert param in ignored
+                assert param.dtype == torch.float32
+                for key in model.load_spec_mapping[name].global_hf_keys:
+                    assert model._get_save_dtype(key, torch.bfloat16) == torch.float32
+            elif name.endswith(".self_attn.in_proj.weight"):
+                projection_count += 1
+                assert name not in model._fsdp_ignored_param_names
+                assert param not in ignored
+                for key in model.load_spec_mapping[name].global_hf_keys:
+                    assert model._get_save_dtype(key, torch.bfloat16) == torch.bfloat16
+        assert projection_count == 5
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Eight CUDA devices are required")
+    def test_real_fsdp_fp32_forward_and_gradient_sync(self, tmp_path) -> None:
+        mp.start_processes(
+            _check_ncp_dt_bias_fp32,
+            args=(f"file://{tmp_path / 'ncp-dt-bias-rendezvous'}",),
+            nprocs=8,
+            start_method="spawn",
+            join=True,
+        )
