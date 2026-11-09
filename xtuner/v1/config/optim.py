@@ -1,4 +1,5 @@
 import os
+import re
 from abc import abstractmethod
 from typing import Literal, Optional, Tuple
 
@@ -174,10 +175,10 @@ class MuonConfig(OptimConfig):
         float | None,
         Parameter(help="Weight decay for embedding parameters. None uses weight_decay."),
     ] = None
-    lm_head_weight_decay: Annotated[
-        float | None,
-        Parameter(help="Weight decay for LM head parameters in the AdamW group. None uses weight_decay."),
-    ] = None
+    weight_decay_overrides: Annotated[
+        dict[str, float],
+        Parameter(help="Ordered regex-to-weight-decay overrides for named parameters. First match wins."),
+    ] = {}
     one_d_weight_decay: Annotated[
         float | None,
         Parameter(help="Weight decay for 1D / bias parameters in the AdamW group. None uses weight_decay."),
@@ -205,6 +206,15 @@ class MuonConfig(OptimConfig):
                 metadata = provider()
                 muon_split_sizes.update(metadata.get("split_sizes", {}))
         param_options = metadata.get("param_options", {})
+        weight_decay_overrides = {}
+        for name, p in model.named_parameters(remove_duplicate=False):
+            for pattern, decay in self.weight_decay_overrides.items():
+                if re.search(pattern, name):
+                    if p in weight_decay_overrides and weight_decay_overrides[p] != decay:
+                        raise ValueError(f"Conflicting weight decay overrides for shared parameter at {name!r}")
+                    weight_decay_overrides[p] = decay
+                    break
+
         explicit_adamw_params = {}
         for module in model.modules():
             get_muon_split_sizes = getattr(module, "get_muon_split_sizes", None)
@@ -285,9 +295,7 @@ class MuonConfig(OptimConfig):
                 else:
                     is_embed = "embed_tokens" in name or name.endswith("embeddings.weight")
                     is_1d = p.ndim < 2 or p.numel() in p.shape
-                    if self.lm_head_weight_decay is not None and "lm_head" in name:
-                        explicit_adamw_params.setdefault(self.lm_head_weight_decay, []).append(p)
-                    elif self.embedding_weight_decay is not None and is_embed:
+                    if self.embedding_weight_decay is not None and is_embed:
                         adamw_embed_params.append(p)
                     elif self.one_d_weight_decay is not None and is_1d:
                         adamw_1d_params.append(p)
@@ -352,15 +360,19 @@ class MuonConfig(OptimConfig):
                     weight_decay=decay,
                 )
             )
-        total_assigned = (
-            len(muon_params_regular)
-            + len(muon_params_moe_fused_w1w3)
-            + len(muon_params_moe_other)
-            + len(adamw_params)
-            + len(adamw_embed_params)
-            + len(adamw_1d_params)
-            + sum(len(parameters) for parameters in explicit_adamw_params.values())
-        )
+
+        if weight_decay_overrides:
+            overridden_param_groups = []
+            for group in param_groups:
+                params_by_decay = {}
+                for p in group["params"]:
+                    decay = weight_decay_overrides.get(p, group.get("weight_decay", self.weight_decay))
+                    params_by_decay.setdefault(decay, []).append(p)
+                for decay, parameters in params_by_decay.items():
+                    overridden_param_groups.append({**group, "params": parameters, "weight_decay": decay})
+            param_groups = overridden_param_groups
+
+        total_assigned = sum(len(group["params"]) for group in param_groups)
         total_trainable = len(trainable_names)
         assert total_assigned == total_trainable, (
             f"Parameter assignment mismatch: {total_assigned} assigned vs {total_trainable} trainable. "

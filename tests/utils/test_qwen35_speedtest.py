@@ -36,6 +36,7 @@ def test_speedtest_uses_unpacked_indexed_tokens_and_scalar_moe_path(
     assert trainer.model_cfg.ep_size == 1
     assert trainer.model_cfg.dispatcher is None
     assert trainer.model_cfg.expert_backend == "grouped_gemm"
+    assert trainer.optim_cfg.weight_decay_overrides == {r"(?:^|\.)lm_head\.": 0.0}
     assert trainer.fsdp_cfg.tp_size == 1
     assert trainer.fsdp_cfg.ep_size == 1
     assert trainer.sp_size == 1
