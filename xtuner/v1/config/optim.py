@@ -142,14 +142,87 @@ class AdamWConfig(OptimConfig):
 
 
 class ParamOverride(BaseModel):
+    """Algorithm and weight-decay settings for one regex-selected parameter set.
+
+    ``MuonConfig.param_overrides`` maps ordered regex patterns to these settings. It only affects trainable parameters
+    handled by ``MuonConfig``; it does not apply to ``AdamWConfig``. A pattern that matches no trainable parameter is
+    silently ignored, and an entry whose fields are both ``None`` leaves the inherited settings unchanged.
+
+    Rule ordering:
+        For each parameter name, the first matching pattern wins; later patterns are not evaluated for that name.
+        Put exact rules before broad rules. Repeating the exact same key in a Python dict is different: Python keeps
+        only the last value before ``MuonConfig`` can validate it.
+
+    Inheritance and precedence:
+        ``algorithm=None`` inherits the model's ``param_options`` algorithm when ``concept_muon=True`` and the model
+        provides it. Otherwise the default shape/name classification is used: non-degenerate 2D parameters other than
+        embeddings and the LM head use Muon; all other parameters use AdamW.
+
+        ``weight_decay=None`` inherits the first available value in this highest-to-lowest priority order:
+
+        1. The ``weight_decay`` in the matching ``param_overrides`` entry.
+        2. The model's ``param_options`` decay when ``concept_muon=True``.
+        3. ``embedding_weight_decay`` for embeddings or ``one_d_weight_decay`` for 1D/bias parameters in AdamW groups.
+        4. The global ``weight_decay`` (default ``0.1``).
+
+        Different values at different priority levels are intentional overrides, not errors. In particular, a user
+        override may replace the model or category decay without changing the algorithm.
+
+    Shared parameters:
+        Aliases of one tied parameter are resolved separately and then merged field by field. One alias may supply the
+        algorithm while another supplies decay. Conflicting non-None values for either field raise ``ValueError``;
+        aliases cannot select independent algorithms or decay values for the same parameter object.
+
+    Validation errors:
+        ``ValueError`` (including Pydantic validation errors) is raised for the following configurations:
+
+        - Nonempty legacy ``weight_decay_overrides`` together with nonempty ``param_overrides``. Legacy overrides used
+          alone are normalized to ``param_overrides`` with ``algorithm=None``.
+        - Conflicting algorithm or decay values from aliases of a shared parameter.
+        - A user algorithm that differs from the model's ``param_options`` algorithm.
+        - An AdamW parameter that matches both embedding and 1D categories when their explicitly configured decay
+          values differ.
+        - An invalid regex, an algorithm other than ``"muon"`` or ``"adamw"``, or unknown override fields.
+        - An explicit Muon assignment for a parameter with fewer than two dimensions. ``ConceptMuon`` additionally
+          requires 2D parameters and rejects higher-rank tensors during optimizer construction.
+
+    Example:
+        .. code-block:: python
+
+            optim_cfg = MuonConfig(
+                weight_decay=0.1,
+                embedding_weight_decay=0.0,
+                one_d_weight_decay=0.0,
+                param_overrides={
+                    r"^projection\\.weight$": {"algorithm": "adamw", "weight_decay": 0.03},
+                    r"^projection\\.": {"weight_decay": 0.2},
+                },
+            )
+
+        Here ``projection.weight`` uses AdamW with decay ``0.03``. Other projection parameters, including its bias,
+        inherit their default algorithm and use decay ``0.2``. Parameters outside ``projection`` are unchanged.
+
+    Inspecting effective settings:
+        Configuration validation does not print the resolved groups. To verify the actual algorithm and decay after
+        all inheritance and overrides, inspect ``optimizer.param_groups`` directly:
+
+        .. code-block:: python
+
+            optimizer = optim_cfg.build(model)
+            groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
+            for name, param in model.named_parameters():
+                group = groups[id(param)]
+                print(name, group["algorithm"], group["weight_decay"])
+    """
+
     model_config = ConfigDict(extra="forbid")
     algorithm: Annotated[
         Literal["muon", "adamw"] | None,
-        Parameter(help="Optimizer algorithm. None uses the default parameter classification."),
+        Parameter(help="Optimizer algorithm. None inherits model metadata or default shape/name classification."),
     ] = None
     weight_decay: Annotated[
         float | None,
-        Parameter(help="Weight decay override. None inherits the applicable default."),
+        Parameter(help="Weight decay override. None inherits model, category, then global defaults."),
     ] = None
 
 
@@ -193,7 +266,10 @@ class MuonConfig(OptimConfig):
     ] = None
     param_overrides: Annotated[
         dict[str, ParamOverride],
-        Parameter(help="Ordered regex-to-algorithm/weight-decay overrides. First match per name wins."),
+        Parameter(
+            help="Ordered regex-to-algorithm/weight-decay overrides. First match per name wins; "
+            "see ParamOverride for inheritance, conflict rules, and resolved-group inspection."
+        ),
     ] = {}
 
     @model_validator(mode="before")
