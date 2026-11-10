@@ -2,9 +2,10 @@
 """Muon optimizer tests.
 
 1. TestNewtonSchulz     — Triton vs PyTorch Newton-Schulz precision.
-2. TestMuonSingleGPU   — Single-GPU correctness: production Muon must match the
+2. Parameter overrides — Algorithm and weight-decay parameter-group overrides.
+3. TestMuonSingleGPU   — Single-GPU correctness: production Muon must match the
                           reference within tight tolerances (fp32, no comms).
-3. TestMuonFSDP        — End-to-end correctness: one Muon step on a fully-sharded
+4. TestMuonFSDP        — End-to-end correctness: one Muon step on a fully-sharded
                           model must match a single-process reference for every
                           parameter, covering all four communication strategies
                           (all_to_all, agrs, local, subgroup_allgather).
@@ -13,9 +14,12 @@
 import copy
 import math
 import os
+from types import SimpleNamespace
 from typing import Callable, Literal, overload
+from unittest.mock import patch
 
 import parametrize
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -138,6 +142,185 @@ def test_qkv_split_gathers_before_orthogonalize():
     torch.testing.assert_close(result, expected)
 
 
+class _ParamOverrideModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(n_routed_experts=1)
+        self.embed_tokens = nn.Embedding(8, 4)
+        self.lm_head = nn.Linear(4, 8, bias=False)
+        self.projection = nn.Linear(4, 4)
+        self.norm = nn.LayerNorm(4)
+        self.conv1d = nn.Conv1d(4, 4, 3, groups=4, bias=False)
+
+    def trainable_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        return list(self.named_parameters())
+
+
+def _build_param_override_optimizer(model: nn.Module, cfg: MuonConfig):
+    with (
+        patch("xtuner.v1.config.optim.dist.get_rank", return_value=1),
+        patch("xtuner.v1.optim.muon.Muon._init_moe_subgroups"),
+    ):
+        return cfg.build(model)
+
+
+def _param_override_groups(model: nn.Module, optimizer) -> dict[int, dict]:
+    assignments = [(p, group) for group in optimizer.param_groups for p in group["params"]]
+    groups = {id(p): group for p, group in assignments}
+    assert len(groups) == len(assignments) == len(list(model.parameters()))
+    return groups
+
+
+class TestMuonParamOverrides:
+    @pytest.mark.parametrize(
+        ("overrides", "expected_updates"),
+        [
+            ({}, {}),
+            (
+                {r"(?:^|\.)lm_head\.": {"weight_decay": 0.0}},
+                {"lm_head.weight": ("adamw", 0.0)},
+            ),
+            (
+                {r"(?:^|\.)lm_head\.": {"algorithm": "muon", "weight_decay": 0.03}},
+                {"lm_head.weight": ("muon", 0.03)},
+            ),
+            (
+                {
+                    r"^projection\.weight$": {"algorithm": "adamw", "weight_decay": 0.03},
+                    r"^projection\.": {"weight_decay": 0.2},
+                },
+                {"projection.weight": ("adamw", 0.03), "projection.bias": ("adamw", 0.2)},
+            ),
+            (
+                {r"^embed_tokens\.": {"weight_decay": 0.2}},
+                {"embed_tokens.weight": ("adamw", 0.2)},
+            ),
+        ],
+    )
+    def test_param_overrides(self, overrides: dict[str, dict], expected_updates: dict[str, tuple[str, float]]) -> None:
+        model = _ParamOverrideModel()
+        cfg = MuonConfig(
+            weight_decay=0.1,
+            embedding_weight_decay=0.0,
+            one_d_weight_decay=0.0,
+            param_overrides=overrides,
+        )
+        optimizer = _build_param_override_optimizer(model, cfg)
+        groups = _param_override_groups(model, optimizer)
+        expected = {
+            "embed_tokens.weight": ("adamw", 0.0),
+            "lm_head.weight": ("adamw", 0.1),
+            "projection.weight": ("muon", 0.1),
+            "projection.bias": ("adamw", 0.0),
+            "norm.weight": ("adamw", 0.0),
+            "norm.bias": ("adamw", 0.0),
+            "conv1d.weight": ("adamw", 0.1),
+        }
+        expected.update(expected_updates)
+        for name, param in model.named_parameters():
+            group = groups[id(param)]
+            assert (group["algorithm"], group["weight_decay"]) == expected[name], name
+
+    @pytest.mark.parametrize(
+        ("overrides", "field"),
+        [
+            (
+                {
+                    r"^embed_tokens\.": {"weight_decay": 0.0},
+                    r"^lm_head\.": {"weight_decay": 0.1},
+                },
+                "weight_decay",
+            ),
+            (
+                {
+                    r"^embed_tokens\.": {"algorithm": "adamw"},
+                    r"^lm_head\.": {"algorithm": "muon"},
+                },
+                "algorithm",
+            ),
+        ],
+    )
+    def test_shared_parameter_rejects_conflicting_aliases(self, overrides: dict[str, dict], field: str) -> None:
+        model = _ParamOverrideModel()
+        model.lm_head.weight = model.embed_tokens.weight
+        cfg = MuonConfig(param_overrides=overrides)
+
+        with pytest.raises(ValueError, match=f"Conflicting parameter overrides.*{field}"):
+            _build_param_override_optimizer(model, cfg)
+
+    def test_shared_parameter_merges_compatible_aliases(self) -> None:
+        model = _ParamOverrideModel()
+        model.lm_head.weight = model.embed_tokens.weight
+        cfg = MuonConfig(
+            param_overrides={
+                r"^embed_tokens\.": {"algorithm": "adamw"},
+                r"^lm_head\.": {"weight_decay": 0.03},
+            }
+        )
+
+        optimizer = _build_param_override_optimizer(model, cfg)
+        group = _param_override_groups(model, optimizer)[id(model.embed_tokens.weight)]
+        assert (group["algorithm"], group["weight_decay"]) == ("adamw", 0.03)
+
+    def test_model_metadata_rejects_conflicting_algorithm(self) -> None:
+        model = _ParamOverrideModel()
+        model.get_muon_metadata = lambda: {
+            "param_options": {model.projection.weight: {"algorithm": "muon", "weight_decay": 0.1}}
+        }
+        cfg = MuonConfig(
+            concept_muon=True,
+            param_overrides={r"^projection\.weight$": {"algorithm": "adamw"}},
+        )
+
+        with pytest.raises(ValueError, match="Conflicting optimizer algorithms"):
+            _build_param_override_optimizer(model, cfg)
+
+    def test_user_decay_overrides_model_metadata_default(self) -> None:
+        model = _ParamOverrideModel()
+        model.get_muon_metadata = lambda: {
+            "param_options": {model.conv1d.weight: {"algorithm": "adamw", "weight_decay": 0.1}}
+        }
+        cfg = MuonConfig(
+            concept_muon=True,
+            param_overrides={r"^conv1d\.weight$": {"weight_decay": 0.03}},
+        )
+
+        optimizer = _build_param_override_optimizer(model, cfg)
+        group = _param_override_groups(model, optimizer)[id(model.conv1d.weight)]
+        assert (group["algorithm"], group["weight_decay"]) == ("adamw", 0.03)
+
+    def test_legacy_weight_decay_overrides_are_normalized(self) -> None:
+        pattern = r"(?:^|\.)lm_head\."
+        cfg = MuonConfig(weight_decay_overrides={pattern: 0.03})
+        assert cfg.param_overrides[pattern].weight_decay == 0.03
+        assert cfg.param_overrides[pattern].algorithm is None
+
+        with pytest.raises(ValueError, match="cannot be used together"):
+            MuonConfig(
+                weight_decay_overrides={pattern: 0.0},
+                param_overrides={pattern: {"weight_decay": 0.03}},
+            )
+
+    def test_embedding_and_one_d_defaults_conflict(self) -> None:
+        model = _ParamOverrideModel()
+        model.embed_tokens = nn.Embedding(4, 1)
+        cfg = MuonConfig(embedding_weight_decay=0.0, one_d_weight_decay=0.1)
+
+        with pytest.raises(ValueError, match="matches both embedding"):
+            _build_param_override_optimizer(model, cfg)
+
+    def test_invalid_override_pattern(self) -> None:
+        with pytest.raises(ValueError, match="Invalid parameter override pattern"):
+            MuonConfig(param_overrides={"[": {"weight_decay": 0.0}})
+
+    def test_muon_override_rejects_vector(self) -> None:
+        model = _ParamOverrideModel()
+        cfg = MuonConfig(param_overrides={r"^norm\.weight$": {"algorithm": "muon"}})
+
+        with pytest.raises(ValueError, match="Muon requires at least 2D parameters"):
+            _build_param_override_optimizer(model, cfg)
+
+
 # ─── Model for end-to-end tests ──────────────────────────────────────────────
 
 
@@ -210,12 +393,19 @@ class ToyMoEModel(BaseModel):
         w1w3_out = self.fused_w1w3(h)
         gate, up = w1w3_out.chunk(2, dim=-1)
         hidden = F.silu(gate) * up
-        # Per-expert w2: reshape to (*, n_experts, intermediate) then batch matmul
+        # Per-expert w2 with explicit slices for DTensor-compatible autograd.
         hidden = hidden.view(*hidden.shape[:-1], self.config.n_routed_experts, self.config.moe_intermediate_size)
-        w2 = self.fused_w2.weight.view(
-            self.config.n_routed_experts, self.config.hidden_size, self.config.moe_intermediate_size
-        )
-        expert_out = torch.einsum("...ei,ehi->...eh", hidden, w2).sum(-2)
+        w2 = self.fused_w2.weight
+        expert_out = torch.stack(
+            [
+                F.linear(
+                    hidden[..., expert, :],
+                    w2.narrow(0, expert * self.config.hidden_size, self.config.hidden_size),
+                )
+                for expert in range(self.config.n_routed_experts)
+            ],
+            dim=-2,
+        ).sum(-2)
         h = h + expert_out
         logits = self.lm_head(h)
         return logits.sum()

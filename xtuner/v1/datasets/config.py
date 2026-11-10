@@ -53,7 +53,13 @@ class DatasetConfig(BaseModel):
     enable_mmap_shared: Annotated[bool, Parameter(group="dataset")] = False
     media_root: Annotated[str | None, Parameter(group="dataset")] = ""
     disable_filter: Annotated[bool, Parameter(group="dataset")] = False
-    sequence_length: Annotated[int | None, Parameter(group="dataset")] = None
+    sequence_length: Annotated[
+        int | None,
+        Parameter(
+            group="dataset",
+            help="Source tokens per sample; causal SFT collators produce one fewer model token, so use target length + 1",
+        ),
+    ] = None
 
     def build(
         self,
@@ -304,12 +310,20 @@ class DataloaderConfig(BaseDataloaderConfig):
         | str,
         Parameter(help="collator func name"),
     ] = "sft_llm_collator"
-    pack_to_max_length: Annotated[bool, Parameter(help="whether to pack to max length")] = True
+    pack_to_max_length: Annotated[
+        bool,
+        Parameter(help="Pad inputs and targets to pack_max_length after causal shifting; padded targets are ignored"),
+    ] = True
     pack_level: Annotated[
         Literal["soft", "none", "__legacy", "hard", "mllm_hybrid", "preset"],
         Parameter(help="__legacy is only for debug; preset requires pack_config_path and sampler_config_path"),
     ] = "soft"
-    pack_max_length: Annotated[int, Parameter(help="pack max length")] = 32768
+    pack_max_length: Annotated[
+        int,
+        Parameter(
+            help="Maximum source tokens per pack before causal shifting; causal collators produce one fewer token"
+        ),
+    ] = 32768
     pack_chunk_size: Annotated[int, Parameter(help="pack chunk size")] = 10000
     pack_workers: Annotated[int, Parameter(help="pack workers")] = 8
     global_pack: Annotated[bool, Parameter(help="enable or disable global pack mode")] = True

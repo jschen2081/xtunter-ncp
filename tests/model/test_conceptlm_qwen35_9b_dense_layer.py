@@ -147,7 +147,7 @@ class TestConceptLMQwen35V2DenseLayer:
         groups = {id(param): group for group in optimizer.param_groups for param in group["params"]}
         for param in conv_weights.values():
             group = groups[id(param)]
-            assert group["algorithm"] == ("adamw" if concept_muon else "muon")
+            assert group["algorithm"] == "adamw"
             assert group["weight_decay"] == (0.1 if concept_muon else 0.03)
 
     @pytest.mark.parametrize("concept_muon", [False, True])
