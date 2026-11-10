@@ -393,12 +393,19 @@ class ToyMoEModel(BaseModel):
         w1w3_out = self.fused_w1w3(h)
         gate, up = w1w3_out.chunk(2, dim=-1)
         hidden = F.silu(gate) * up
-        # Per-expert w2: reshape to (*, n_experts, intermediate) then batch matmul
+        # Per-expert w2 with explicit slices for DTensor-compatible autograd.
         hidden = hidden.view(*hidden.shape[:-1], self.config.n_routed_experts, self.config.moe_intermediate_size)
-        w2 = self.fused_w2.weight.view(
-            self.config.n_routed_experts, self.config.hidden_size, self.config.moe_intermediate_size
-        )
-        expert_out = torch.einsum("...ei,ehi->...eh", hidden, w2).sum(-2)
+        w2 = self.fused_w2.weight
+        expert_out = torch.stack(
+            [
+                F.linear(
+                    hidden[..., expert, :],
+                    w2.narrow(0, expert * self.config.hidden_size, self.config.hidden_size),
+                )
+                for expert in range(self.config.n_routed_experts)
+            ],
+            dim=-2,
+        ).sum(-2)
         h = h + expert_out
         logits = self.lm_head(h)
         return logits.sum()
