@@ -165,15 +165,33 @@ class GroupedLinear(nn.Module):
         tokens_per_expert: torch.Tensor,
         *,
         trainable_weight: torch.Tensor | None = None,
+        grad_weight_out: torch.Tensor | None = None,
+        grad_weight_first: bool = False,
     ):
         # A dynamic EP backend may supply a differentiable call-local alias.
-        # The selected one-segment op still returns its dW through autograd.
+        # A non-None grad_weight_out selects X8 (_GMMWithGradWeightOut):
+        #   backward writes dW straight into the [E,O,I] heap slots (grad_t@x),
+        #   skipping the autograd intermediate dW tensor + copy. None (default)
+        #   = original behavior (autograd dw). The dispatcher passes in a MoonEP
+        #   xt_grad_home_view heap-slot view; this layer is unaware of the
+        #   heap semantics.
         if trainable_weight is None:
             weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
             weight = weight.view(-1, self.local_out_features, self.local_in_features)
         else:
             weight = trainable_weight
-        out = group_gemm(x, weight, tokens_per_expert)
+        if grad_weight_out is None:
+            # Every backend accepts the plain form; ``grad_weight_first`` is
+            # MoonEP-Ascend-only and the CUDA/CPU kernels reject the keyword.
+            out = group_gemm(x, weight, tokens_per_expert)
+        else:
+            out = group_gemm(
+                x,
+                weight,
+                tokens_per_expert,
+                grad_weight_out=grad_weight_out,
+                grad_weight_first=grad_weight_first,
+            )
 
         if self.moe_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias

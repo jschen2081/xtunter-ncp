@@ -1,3 +1,4 @@
+import os
 from typing import Tuple
 
 import torch
@@ -29,6 +30,6 @@ def npu_token_unpermute(
 ) -> torch.Tensor:
     from torch_npu import npu_moe_token_unpermute
 
-    if probs is not None:
+    if probs is not None and not os.environ.get("XT_UNPERMUTE_FP32"):
         probs = probs.to(torch.bfloat16)
     return npu_moe_token_unpermute(input_act, row_id_map, probs=probs)

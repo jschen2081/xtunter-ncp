@@ -48,11 +48,20 @@ class ShardDescriptor(BaseModel):
             # XTuner may initialize modules while the default device is meta. PyTorch's
             # placement helper inherits that default for temporary shape arithmetic.
             with torch.device(get_device()):
-                local_size, offset = Shard(self.dim)._local_shard_size_and_offset(  # type: ignore[attr-defined]
-                    dim_size,
-                    world_size,
-                    rank,
-                )
+                _shard = Shard(self.dim)
+                _local_shard_size_and_offset = getattr(_shard, "_local_shard_size_and_offset", None)
+                if _local_shard_size_and_offset is not None:
+                    # torch 2.12 renamed the helper; it takes the same
+                    # (dim_size, world_size, rank) and returns (local_size, offset).
+                    local_size, offset = _local_shard_size_and_offset(dim_size, world_size, rank)
+                else:
+                    # torch 2.7 (the build torch_npu ships) only has this form.
+                    local_size, offset = _shard._local_shard_size_on_dim(  # type: ignore[attr-defined]
+                        dim_size,
+                        world_size,
+                        rank,
+                        return_offset=True,
+                    )
             return [(offset, offset + local_size)] if local_size else []
 
         split_count = world_size * self.interleave_factor

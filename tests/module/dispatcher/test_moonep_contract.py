@@ -70,6 +70,7 @@ def test_non_moonep_build_does_not_import_optional_backend() -> None:
     source = """
 import sys
 sys.modules[\"moonep\"] = None
+sys.modules[\"moonep_ascend\"] = None
 from xtuner.v1.module.dispatcher import NaiveDispatcher, build_dispatcher
 dispatcher = build_dispatcher(None, n_routed_experts=4)
 assert isinstance(dispatcher, NaiveDispatcher)
@@ -81,6 +82,7 @@ def test_selecting_moonep_reports_the_missing_optional_backend() -> None:
     source = """
 import sys
 sys.modules["moonep"] = None
+sys.modules["moonep_ascend"] = None
 from types import SimpleNamespace
 from xtuner.v1.module.dispatcher.moonep import MoonEPModelRuntime
 try:
@@ -170,20 +172,30 @@ def test_moe_list_forward_rejects_a_different_width(width: int) -> None:
         )
 
 
-def test_runtime_meta_build_does_not_require_or_allocate_a_backend_workspace(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("backend_path", "buffer_attr", "is_ascend"),
+    [
+        ("/tmp/MoonEP-mod/moonep/__init__.py", "Buffer", False),
+        ("/tmp/MoonEP-Ascend/moonep_ascend/__init__.py", "BufferXtuner", True),
+    ],
+)
+def test_runtime_meta_build_does_not_require_or_allocate_a_backend_workspace(
+    monkeypatch, backend_path: str, buffer_attr: str, is_ascend: bool
+) -> None:
     from xtuner.v1.module.dispatcher import moonep as moonep_integration
     from xtuner.v1.module.dispatcher.moonep import MoonEPModelRuntime
     from xtuner.v1.module.grouped_linear import moe_group_linear
     from xtuner.v1.ops.moe.cuda.group_gemm import triton_group_gemm
 
     # Workspace policy belongs to XTuner and allocation happens only after
-    # FSDP installation, so the optional backend needs no workspace interface.
+    # FSDP installation, so neither backend needs a workspace interface.
     backend = SimpleNamespace(
-        __file__="/tmp/MoonEP-mod/moonep/__init__.py",
+        __file__=backend_path,
         XTUNER_INTEGRATION_API_VERSION=3,
-        Buffer=object,
+        **{buffer_attr: object},
     )
     monkeypatch.setattr(moonep_integration, "_moonep_backend", backend)
+    monkeypatch.setattr(moonep_integration, "_ASCEND_BACKEND", is_ascend)
     monkeypatch.setattr(moonep_integration, "_MOONEP_IMPORT_ERROR", None)
     monkeypatch.setattr(moe_group_linear, "group_gemm", triton_group_gemm)
     ep_group = SimpleNamespace(size=lambda: 4)
@@ -208,6 +220,7 @@ def test_runtime_allows_triton_grouped_gemm(monkeypatch) -> None:
     from xtuner.v1.module.grouped_linear import moe_group_linear
     from xtuner.v1.ops.moe.cuda.group_gemm import triton_group_gemm
 
+    # Triton grouped GEMM is the CUDA backend's path.
     monkeypatch.setattr(
         moonep_integration,
         "_moonep_backend",
@@ -215,6 +228,7 @@ def test_runtime_allows_triton_grouped_gemm(monkeypatch) -> None:
             __file__="/tmp/MoonEP-mod/moonep/__init__.py", XTUNER_INTEGRATION_API_VERSION=3, Buffer=object
         ),
     )
+    monkeypatch.setattr(moonep_integration, "_ASCEND_BACKEND", False)
     monkeypatch.setattr(moonep_integration, "_MOONEP_IMPORT_ERROR", None)
     monkeypatch.setattr(moe_group_linear, "group_gemm", triton_group_gemm)
 
@@ -247,6 +261,7 @@ def test_capability_check_requires_grouped_gemm_cutlass_backend(
     from xtuner.v1.ops.moe.cuda import cutlass_group_gemm
 
     assert cutlass_group_gemm is not None
+    # The cutlass requirement is a CUDA-backend capability check.
     monkeypatch.setattr(
         moonep_integration,
         "_moonep_backend",
@@ -256,6 +271,7 @@ def test_capability_check_requires_grouped_gemm_cutlass_backend(
             Buffer=object,
         ),
     )
+    monkeypatch.setattr(moonep_integration, "_ASCEND_BACKEND", False)
     monkeypatch.setattr(moonep_integration, "_MOONEP_IMPORT_ERROR", None)
     monkeypatch.setattr(moe_group_linear, "group_gemm", cutlass_group_gemm)
     monkeypatch.setattr(grouped_gemm_backend, "use_cutlass", effective_cutlass)
@@ -281,6 +297,7 @@ def test_runtime_reports_optional_backend_source_on_capability_mismatch(monkeypa
         XTUNER_INTEGRATION_API_VERSION=0,
     )
     monkeypatch.setattr(moonep_integration, "_moonep_backend", backend)
+    monkeypatch.setattr(moonep_integration, "_ASCEND_BACKEND", False)
     monkeypatch.setattr(moonep_integration, "_MOONEP_IMPORT_ERROR", None)
 
     with pytest.raises(RuntimeError, match="/wrong/worktree/moonep/__init__.py"):

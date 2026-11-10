@@ -1,3 +1,4 @@
+import os
 from functools import partial
 from typing import Callable, Literal, Protocol, TypeAlias, TypedDict, cast
 
@@ -41,7 +42,7 @@ from xtuner.v1.module.grouped_linear.moe_group_linear import build_grouped_linea
 from xtuner.v1.module.moe_backend import SonicMoEBackendConfig
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn, get_mlp_act_fn
-from xtuner.v1.utils import ForwardState
+from xtuner.v1.utils import ForwardState, get_device
 
 from ..linear import build_linear
 
@@ -62,6 +63,47 @@ def _prepare_rollout_routed_experts_for_router(
     if offload_rollout_routed_experts and rollout_routed_experts.device != hidden_states.device:
         rollout_routed_experts = rollout_routed_experts.contiguous()
     return rollout_routed_experts.to(device=hidden_states.device, dtype=torch.long)
+
+
+def _intra_layer_interleave_enabled() -> bool:
+    """Whether in-layer micro-batches pipeline dispatch against experts GEMM.
+
+    ``MOONEP_DISPATCH_OVERLAP=1`` submits micro-batch ``i``'s routed dispatch and
+    then immediately issues micro-batch ``i-1``'s postprocess + experts GEMM, so
+    the AIV dispatch runs while the Cube GEMM of the previous micro-batch runs
+    on the compute stream.
+
+    Issuing the compute only after *every* dispatch has been submitted is not
+    enough on Ascend: the plan ends in a small D2H that blocks the host until
+    the preceding dispatch kernel has retired, so the GEMMs would all be
+    submitted after the dispatches already finished on device and nothing would
+    overlap. Handing the previous micro-batch's compute to the host during that
+    wait costs it almost nothing (no D2H there) and is what makes the overlap
+    real.
+
+    Only the *dispatch* is reordered. The routed weight prefetch is the one part
+    of ``dispatch`` with a cross-micro-batch hazard — the expert home section
+    holds a single set of B borrow slots per generation, so micro-batch i+1's
+    prefetch would overwrite the experts micro-batch i's GEMM still reads — and
+    it is deferred to ``prepare_experts`` for that call instead of running
+    inside ``dispatch``. See ``_async_parallel_enabled`` in the MoonEP
+    dispatcher. Default on, and Ascend-only: the CUDA MoonEP Buffer has no
+    prefetch hook or micro-batch slot index.
+    """
+    return get_device() == "npu" and os.environ.get("MOONEP_DISPATCH_OVERLAP", "1") == "1"
+
+
+def _combine_overlap_enabled() -> bool:
+    """Whether each in-layer micro-batch's combine is issued right after its GEMM.
+
+    ``MOONEP_COMBINE_OVERLAP=1`` submits micro-batch ``i``'s combine as soon as
+    its experts GEMM is queued, instead of collecting every micro-batch's
+    combine at the layer tail. The combine is launched on MoonEP's own stream
+    and returns to the host immediately, so micro-batch ``i+1``'s GEMM is
+    submitted beside it rather than after it. Output order is unchanged.
+    Default on, and Ascend-only for the same reason as the dispatch overlap.
+    """
+    return get_device() == "npu" and os.environ.get("MOONEP_COMBINE_OVERLAP", "1") == "1"
 
 
 class MoEDecoderLayerOutput(TypedDict):
@@ -319,9 +361,24 @@ class MoEBlock(nn.Module):
         weight_layout: ExpertWeightLayout,
     ) -> torch.Tensor:
         trainable = weight_layout.trainable_weights or (None, None)
-        gate_up_out = self.fused_w1w3(x, tokens_per_expert, trainable_weight=trainable[0])
+        # X8 (grad_weight_out): dispatcher-supplied heap gradient slot views.
+        # When present, GroupedLinear → _GMMWithGradWeightOut writes dW directly
+        # into the heap (home add_ + dup copy_), bypassing the autograd dW path;
+        # the bridge still fires via dx to trigger reduce_grad_bf16 + FSDP writeback.
+        gwo = weight_layout.grad_weight_out or (None, None)
+        # grad_weight_first = first producer of this FSDP call (the home has
+        # already been zeroed by the dispatcher) -> the GEMM dw writes the
+        # whole heap block directly, with zero materialization.
+        gwo_first = getattr(weight_layout, "grad_weight_first", False)
+        gate_up_out = self.fused_w1w3(
+            x, tokens_per_expert, trainable_weight=trainable[0],
+            grad_weight_out=gwo[0], grad_weight_first=gwo_first,
+        )
         out = self.moe_act(gate_up_out, split_dim=-1)
-        res = self.fused_w2(out, tokens_per_expert, trainable_weight=trainable[1])
+        res = self.fused_w2(
+            out, tokens_per_expert, trainable_weight=trainable[1],
+            grad_weight_out=gwo[1], grad_weight_first=gwo_first,
+        )
         return res
 
 
@@ -380,6 +437,12 @@ class MoEDecoderLayer(nn.Module):
         self.hidden_factor = hidden_factor
         self.routed_expert_hidden_size = routed_expert_hidden_size
         self.latent_moe_use_norm = latent_moe_use_norm
+
+        # Overlap the shared-experts GEMM (compute stream) with the dispatch
+        # all-to-all (comm stream). MoonEP's in-layer interleave refactor reads
+        # this attribute; the upstream XTUNER_MOE_SHARED_OVERLAP feature itself
+        # is not part of this branch, so it defaults to off here.
+        self.shared_overlap = os.environ.get("XTUNER_MOE_SHARED_OVERLAP", "0") == "1"
 
         self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet | KimiDeltaAttention = (
             attention_config.build(
@@ -858,17 +921,38 @@ class MoEDecoderLayer(nn.Module):
         experts_out_list: list[torch.Tensor] = []
         pre_combined_list: list[PreCombineResult] = []
         combined_list: list[CombineResult] = []
+        # Pre-init so the overlap path can append inside the dispatch loop; the
+        # serial path (shared_overlap off) and the n_shared_experts == 0 case
+        # are both reassigned in the later shared-experts loop.
+        shared_experts_out_list: list[torch.Tensor | None] = []
 
         # dispatch + experts + pre-combine
-        for router_results, pre_dispatched in zip(
-            router_results_list,
-            pre_dispatched_list,
-        ):
-            dispatched = self.dispatcher.dispatch(
-                pre_dispatched=pre_dispatched,
-                topk_weights=router_results["topk_weights"],
-                async_op=True,
-            )
+        #
+        # ``MOONEP_DISPATCH_OVERLAP=1`` pipelines micro-batch i's routed dispatch
+        # against micro-batch i-1's experts GEMM, so the AIV dispatch runs on
+        # the comm stream while the Cube GEMM runs on the compute stream. The
+        # dispatch contract is already "launch now, join in
+        # dispatch_postprocess", so the reordering adds no waiting. Default off
+        # — see ``_intra_layer_interleave_enabled``.
+        interleave = _intra_layer_interleave_enabled()
+
+        def _issue_routed_compute(i: int) -> None:
+            """Issue micro-batch ``i``'s postprocess + experts GEMM + pre-combine.
+
+            Must be called in increasing ``i``: the three output lists are
+            appended in call order and consumed positionally downstream.
+            """
+            pre_dispatched = pre_dispatched_list[i]
+            dispatched = dispatched_list[i]
+            # Overlap: issue the shared-experts GEMM on the compute stream
+            # while the dispatch all-to-all runs on the comm stream, then
+            # wait for the a2a. Shared input is the attention output
+            # (pre_moe_forward_out), independent of the routed tokens.
+            if self.shared_overlap and self.n_shared_experts > 0:
+                shared_experts_out = self._shared_experts_forward(
+                    hidden_states=pre_moe_forward_out_list[i],
+                )
+                shared_experts_out_list.append(shared_experts_out)
             # wait for pre-dispatch event
             post_dispatched = self.dispatcher.dispatch_postprocess(
                 pre_dispatched=pre_dispatched,
@@ -894,33 +978,92 @@ class MoEDecoderLayer(nn.Module):
 
             post_dispatched_list.append(post_dispatched)
             experts_out_list.append(experts_out)
-            dispatched_list.append(dispatched)
             pre_combined_list.append(pre_combined)
 
-        for pre_combined, pre_dispatched, dispatched, post_dispatched in zip(
-            pre_combined_list,
-            pre_dispatched_list,
-            dispatched_list,
-            post_dispatched_list,
-        ):
-            combined = self.dispatcher.combine(
-                pre_combined=pre_combined,
-                pre_dispatched=pre_dispatched,
-                dispatched=dispatched,
-                post_dispatched=post_dispatched,
+        def _issue_combine(i: int) -> torch.Tensor:
+            """Issue micro-batch ``i``'s routed combine and return its output.
+
+            Reads the lists by index, so it must follow ``_issue_routed_compute(i)``.
+            """
+            return self.dispatcher.combine(
+                pre_combined=pre_combined_list[i],
+                pre_dispatched=pre_dispatched_list[i],
+                dispatched=dispatched_list[i],
+                post_dispatched=post_dispatched_list[i],
                 async_op=True,
             )
-            combined_list.append(combined)
 
-        shared_experts_out_list: list[torch.Tensor | None]
+        combine_overlap = _combine_overlap_enabled()
+        combined_by_index: dict[int, torch.Tensor] = {}
 
-        if self.n_shared_experts > 0:
+        if interleave:
+            # Software pipeline: submit dispatch i, then immediately issue the
+            # compute of micro-batch i-1. That compute needs no host-side data
+            # from dispatch i, so it lands on the compute stream while dispatch
+            # i still runs on the comm stream.
+            issued = 0
+            for i, router_results in enumerate(router_results_list):
+                dispatched_list.append(
+                    self.dispatcher.dispatch(
+                        pre_dispatched=pre_dispatched_list[i],
+                        topk_weights=router_results["topk_weights"],
+                        async_op=True,
+                    )
+                )
+                if issued < i:
+                    _issue_routed_compute(issued)
+                    if combine_overlap:
+                        combined_by_index[issued] = _issue_combine(issued)
+                    issued += 1
+            while issued < len(dispatched_list):
+                _issue_routed_compute(issued)
+                if combine_overlap:
+                    combined_by_index[issued] = _issue_combine(issued)
+                issued += 1
+        else:
+            for i, pre_dispatched in enumerate(pre_dispatched_list):
+                dispatched_list.append(
+                    self.dispatcher.dispatch(
+                        pre_dispatched=pre_dispatched,
+                        topk_weights=router_results_list[i]["topk_weights"],
+                        async_op=True,
+                    )
+                )
+                _issue_routed_compute(i)
+                if combine_overlap:
+                    combined_by_index[i] = _issue_combine(i)
+
+        for i in range(len(pre_combined_list)):
+            if i not in combined_by_index:
+                combined_by_index[i] = self.dispatcher.combine(
+                    pre_combined=pre_combined_list[i],
+                    pre_dispatched=pre_dispatched_list[i],
+                    dispatched=dispatched_list[i],
+                    post_dispatched=post_dispatched_list[i],
+                    async_op=True,
+                )
+            combined_list.append(combined_by_index.pop(i))
+
+        # One cross-rank barrier per layer. ``mb_idx`` already keeps one
+        # micro-batch's slot reset out of another's way, so only the handover to
+        # the next layer's dispatch needs one — and doing it per micro-batch
+        # would cut across the combine/GEMM overlap MOONEP_COMBINE_OVERLAP builds.
+        layer_barrier = getattr(self.dispatcher, "layer_barrier", None)
+        if layer_barrier is not None:
+            layer_barrier()
+
+        if self.n_shared_experts > 0 and not self.shared_overlap:
+            # Serial path: shared-experts GEMM after combine (no overlap).
             shared_experts_out_list = []
             for pre_moe_forward_out in pre_moe_forward_out_list:
                 shared_experts_out = self._shared_experts_forward(
                     hidden_states=pre_moe_forward_out,
                 )
                 shared_experts_out_list.append(shared_experts_out)
+        elif self.n_shared_experts > 0:
+            # shared_overlap: shared forward already issued inside the dispatch
+            # loop above; nothing to do here.
+            pass
         else:
             shared_experts_out_list = [None] * intra_layer_micro_batch
 

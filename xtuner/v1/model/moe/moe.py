@@ -178,6 +178,18 @@ class MoEConfig(TransformerConfig):
     # H200 acceptance workload is measurably faster at 64 than its upstream
     # default of 32; keep it model-scoped so other deployments can tune it.
     moonep_num_sms: int = 64
+    # DirectVMM: tokens per rank per micro-batch
+    #   (fixed-S, SP already divided out). The trainer computes and sets this
+    #   after the dataloader is built -- install_after_fsdp uses it to
+    #   pre-build BufferXtuner (the landings source) so that DirectVMM install
+    #   happens before FSDP's first all_gather.
+    moonep_tokens_per_rank: int | None = None
+    # Number of home window generations. 1 (default) = single generation
+    #   (halves home memory; EP=16: -1.2GB / EP=8: -2.4GB), 2 = double-buffered
+    #   (FSDP implicit prefetch writes the next layer early; needs validation
+    #   of the FSDP prefetch race window).
+    #   Ascend path only; the CUDA VMM workspace is always double-buffered.
+    moonep_home_generations: int = 1
     # TrainEngine resolves this scalar before model build. MoonEP uses it to
     # size per-invocation resources without depending on TrainerConfig.
     intra_layer_micro_batch: int = 1

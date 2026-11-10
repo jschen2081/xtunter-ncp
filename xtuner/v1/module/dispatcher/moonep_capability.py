@@ -32,8 +32,8 @@ def check_config(config: Any) -> None:
         raise ValueError("MoonEP currently requires BF16 expert compute; FP8 is not supported")
     if config.ep_size <= 1:
         raise ValueError("MoonEP requires expert parallelism")
-    if config.ep_size not in (2, 4, 8):
-        raise ValueError("MoonEP requires ep_size in {2, 4, 8}")
+    if config.ep_size not in (2, 4, 8, 16, 32):
+        raise ValueError("MoonEP requires ep_size in {2, 4, 8, 16, 32}")
     if config.n_routed_experts % config.ep_size:
         raise ValueError("MoonEP requires n_routed_experts divisible by ep_size")
     if config.moe_bias:
@@ -69,7 +69,7 @@ def check_fsdp_policy(config: Any, fsdp_config: Any) -> None:
 
     # A blocking rule from the domain model that had no code before: a
     # checkpoint-wrapped MTP physical layer must use reentrant checkpointing.
-    if _any_mtp_layer_checkpoint_wrapped(config, fsdp_config) and not fsdp_config.mtp_checkpoint_use_reentrant:
+    if _any_mtp_layer_checkpoint_wrapped(config, fsdp_config) and not getattr(fsdp_config, "mtp_checkpoint_use_reentrant", False):
         raise ValueError(
             "a checkpoint-wrapped MTP physical layer requires FSDPConfig.mtp_checkpoint_use_reentrant=True with MoonEP"
         )

@@ -19,6 +19,137 @@ import torch
 import torch.distributed as dist
 from typing_extensions import TypedDict
 
+try:  # MoonEP Ascend ops package; falls back to the pure-torch path when absent
+    import moonep_ops
+except ImportError:  # pragma: no cover - only hit in environments without Ascend ops
+    moonep_ops = None  # type: ignore[assignment]
+
+
+_mul_overlap_warning_emitted = False
+
+
+def _warn_mul_disables_combine_overlap() -> None:
+    """Warn once when ``mul`` is paired with the combine/compute overlap.
+
+    ``mul`` runs as an ``aclnnMul`` tiled at every AIV, and a full-core kernel
+    cannot start while a MoonEP collective still holds a core. It therefore
+    waits for the whole dispatch to retire, which pushes the neighbouring
+    micro-batch's experts GEMM behind it — leaving the combine nothing to
+    overlap with. The values are identical to the other two modes; only the
+    overlap is lost, so this is a warning rather than an error.
+    """
+    global _mul_overlap_warning_emitted
+    if _mul_overlap_warning_emitted:
+        return
+    if os.environ.get("MOONEP_COMBINE_OVERLAP", "1") != "1":
+        return
+    _mul_overlap_warning_emitted = True
+    warnings.warn(
+        "MOONEP_MASKED_COPY=mul with MOONEP_COMBINE_OVERLAP=1: the compute view "
+        "runs as a full-core aclnnMul that cannot start while a MoonEP "
+        "collective holds cores, so the combine has no experts GEMM to overlap "
+        "with. Use MOONEP_MASKED_COPY=inplace (default) or 'copy'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _masked_copy_mode() -> str:
+    """Which implementation produces the zeroed compute view.
+
+    ``MOONEP_MASKED_COPY`` selects between three equivalent results:
+
+    - ``inplace`` (default): zero only the rows past ``covered`` in place and hand
+      ``src`` straight to the GEMM, skipping the copy of the covered prefix.
+    - ``copy``: MoonEP ``masked_copy`` into a fresh buffer; the kernel picks its own
+      bounded AIV block count (host-side ``MOONEP_MASKED_COPY_AIV``, default 16).
+    - ``mul``: ``src * row_is_covered``, an ``aclnnMul`` tiled at every AIV.
+
+    The three agree in value (``-0.0`` vs ``+0.0`` is the only bit difference,
+    plus a non-finite padding row becoming 0); they differ in what they cost
+    the main stream, which is what decides whether the neighbouring
+    micro-batch's ``combine`` can retire alongside this micro-batch's experts
+    GEMM.  On Qwen3-235B slim (ILMB=2, single node) ``inplace`` measured
+    5.446 s/step against 5.546 s for ``mul``, and the only reason it can win is
+    that a balanced dispatch has no padding rows to write at all.
+    """
+    if moonep_ops is None or not hasattr(moonep_ops, "masked_copy"):
+        return "mul"
+    mode = os.environ.get("MOONEP_MASKED_COPY", "inplace").strip().lower()
+    if mode in ("0", "mul", "false"):
+        _warn_mul_disables_combine_overlap()
+        return "mul"
+    if mode in ("1", "copy", "true"):
+        return "copy"
+    return "inplace"
+
+
+class _MaskedCopy(torch.autograd.Function):
+    """``dst = src`` over the covered prefix and zeros past it.
+
+    Same values as ``src * row_is_covered`` (the mask is 0/1, so the bf16
+    product is exact), except that the zeroed tail is ``+0.0`` where the
+    multiply keeps the sign bit (``-0.0``), and a non-finite padding row
+    becomes 0 rather than staying non-finite.  Neither difference is visible
+    to the GEMM.  Forward and backward both use the MoonEP kernel,
+    which keeps both directions inside its own AIV block budget.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, src: torch.Tensor, covered: torch.Tensor) -> torch.Tensor:
+        dst = torch.empty_like(src)
+        moonep_ops.masked_copy(dst, src, covered)
+        ctx.save_for_backward(covered)
+        return dst
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor | None, None]:
+        (covered,) = ctx.saved_tensors
+        source = grad if grad.is_contiguous() else grad.contiguous()
+        out = torch.empty_like(source)
+        moonep_ops.masked_copy(out, source, covered)
+        return out, None
+
+
+class _MaskedZeroTail(torch.autograd.Function):
+    """``src`` with the rows past ``covered`` zeroed in place.
+
+    Same values as :class:`_MaskedCopy`, minus the copy: the covered prefix is
+    already what the multiply would produce, so only the padding tail has to be
+    written, and when the dispatch is balanced (``covered == rows``, the normal
+    case for an evenly split all-to-all) the kernel writes nothing at all.
+
+    Writing into ``src`` is safe here because ``prepare_experts`` runs strictly
+    after ``dispatch_event.wait()``: no remote PUT can still be landing in this
+    buffer, so the zeroing cannot clobber an in-flight token.  Backward clears
+    the same tail into a private tensor instead: the incoming ``grad`` is owned
+    by the autograd engine, which guarantees its value but not exclusive
+    ownership.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, src: torch.Tensor, covered: torch.Tensor) -> torch.Tensor:
+        moonep_ops.masked_copy(src, src, covered)
+        ctx.save_for_backward(covered)
+        ctx.mark_dirty(src)
+        return src
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor | None, None]:
+        # Same tail as forward: ``dispatch_backward`` feeds this straight into
+        # ``combine``, so the padding rows must not carry a GEMM gradient.
+        #
+        # The forward may write into ``src`` because it owns that buffer;
+        # ``grad`` is not ours.  The engine only guarantees the value, so a
+        # sibling branch (a residual, or a view onto the same storage) may still
+        # be reading it, and zeroing the tail in place would corrupt that
+        # branch.  Write the masked result into a private tensor.
+        (covered,) = ctx.saved_tensors
+        source = grad if grad.is_contiguous() else grad.contiguous()
+        out = torch.empty_like(source)
+        moonep_ops.masked_copy(out, source, covered)
+        return out, None
+
 
 # Shape legend used by every workspace structure below:
 #   E: global experts, R: EP ranks, B=E/R: home experts per rank,
@@ -439,33 +570,76 @@ class _ExpertVMMWorkspace:
         _ = self._views
         counts = self._local_token_counts(cu_seqlens)
         covered = counts.sum()
-        row_is_covered = torch.arange(hidden_nvsh.shape[0], device=hidden_nvsh.device) < covered
-        hidden = hidden_nvsh * row_is_covered.unsqueeze(-1)
-        counts = torch.cat((counts[:-1], counts[-1:] + hidden_nvsh.shape[0] - covered))
+        n_rows = hidden_nvsh.shape[0]
+        mode = _masked_copy_mode()
+        if mode == "inplace":
+            # ``MOONEP_MASKED_COPY=inplace``: only the padding tail is written,
+            # so a balanced dispatch retires this step with no memory traffic at
+            # all and the experts GEMM can start while the neighbouring
+            # micro-batch's combine is still running.
+            hidden = _MaskedZeroTail.apply(hidden_nvsh, covered.to(torch.int32))
+        elif mode == "copy":
+            # ``MOONEP_MASKED_COPY=1``: same values as the multiply below, but
+            # on a bounded block count so it can overlap a neighbouring
+            # micro-batch's dispatch instead of queueing behind it.
+            hidden = _MaskedCopy.apply(hidden_nvsh, covered.to(torch.int32))
+        else:
+            row_is_covered = torch.arange(n_rows, device=hidden_nvsh.device) < covered
+            hidden = hidden_nvsh * row_is_covered.unsqueeze(-1)
+        counts = torch.cat((counts[:-1], counts[-1:] + n_rows - covered))
         return hidden, counts
 
-    def prefetch_weights(self, *, buffer: Any, plan: Any, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def local_weights(self, *, generation: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """This generation's local ``[2B]`` compute aliases — a pure view.
+
+        Split out of :meth:`prefetch_weights` so a caller that launches the
+        prefetch itself (and only needs the aliases afterwards) does not issue
+        the transfer twice.
+        """
+        return cast(tuple[torch.Tensor, torch.Tensor], self._views["local_weights"][generation])
+
+    def start_prefetch(self, *, buffer: Any, plan: Any, generation: int, stream: Any = None) -> Any:
+        """Launch the weight prefetch without touching the launching stream.
+
+        Only the Ascend workspace implements this: BufferXtuner accepts a
+        generation index and a target stream, while the CUDA Buffer's prefetch
+        is blocking and per-call. The dispatcher only reaches here when the
+        Ascend-only overlap switches are on.
+        """
+        raise NotImplementedError("asynchronous weight prefetch requires the Ascend workspace")
+
+    def prefetch_weights(
+        self,
+        *,
+        buffer: Any,
+        plan: Any,
+        generation: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prefetch the global ``[E+B]`` weights and return this generation's
         local ``[2B]`` compute aliases.
 
         ``buffer`` is the MoonEP ``Buffer`` and ``plan`` its opaque plan
-        object; both stay untyped MoonEP-owned values.
+        object; both stay untyped MoonEP-owned values. The CUDA
+        ``prefetch_weight`` takes no generation index and no stream, so this
+        stays the blocking form; :class:`_ExpertAscendWorkspace` overrides it
+        with the asynchronous variant.
         """
         buffer.prefetch_weight(
             plan=plan,
             projections=self._views["global_weights"][generation],
             async_finish=False,
         )
-        return cast(tuple[torch.Tensor, torch.Tensor], self._views["local_weights"][generation])
+        return self.local_weights(generation=generation)
 
     def return_expert_gradients(
         self,
         *,
         buffer: Any,
         plan: Any,
-        gradients: tuple[torch.Tensor, torch.Tensor],
+        gradients: tuple[torch.Tensor, torch.Tensor] | None,
         grad_slot: int,
         initialize: bool,
+        x8: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Complete the home-expert gradient boundary in the owning module.
 
@@ -475,10 +649,37 @@ class _ExpertVMMWorkspace:
         (``initialize``, a call-local flag owned by the Dispatcher) and added
         to otherwise; the duplicate suffix is slot-local. ``reduce_grad_bf16``
         then sums the EP partials without dividing.
+
+        X8 path (``x8=True``): ``gradients`` is None — dW was already written
+        into the heap by ``_GMMWithGradWeightOut`` (first producer overwrites
+        the whole slot, later producers ``add_``). Skip the zero/add_/copy_
+        block and only run ``reduce_grad_bf16`` over the slot's heap views,
+        then return the home slices.
         """
         if not 0 <= grad_slot < self._gradient_slots:
             raise ValueError(f"gradient slot out of range: {grad_slot}")
         b = self._experts_per_rank
+        slot_views = self._views["local_grad_outputs"][grad_slot]
+
+        if x8:
+            # dW already in the heap (home add_ + dup copy_ by the GEMM); the
+            # home was zeroed on the first producer in prepare_experts. Only
+            # run the EP exact-sum reduction over the slot's full views.
+            #
+            # Making this async removes ~11 ms of host blocking per call
+            # (40 calls/step) but leaves step time unchanged (3-round
+            # interleaved A/B inside run-to-run noise): the host has slack
+            # here, so keep the simpler synchronous contract for this
+            # numerically critical reduction.
+            buffer.reduce_grad_bf16(
+                plan=plan,
+                local_grads=slot_views,
+                distributed_duplicate_grads=self._views["distributed_duplicate_grads"][grad_slot],
+                async_finish=False,
+            )
+            return slot_views[0][:b], slot_views[1][:b]
+
+        assert gradients is not None
         # A slot is reused sequentially across physical layers.  A fresh
         # TensorImpl/version counter over the same VMM storage avoids both
         # payload allocation and AOT version clashes.
@@ -489,7 +690,7 @@ class _ExpertVMMWorkspace:
                 target.shape,
                 target.stride(),
             )
-            for target in self._views["local_grad_outputs"][grad_slot]
+            for target in slot_views
         )
         for target, gradient in zip(targets, gradients, strict=True):
             if initialize:

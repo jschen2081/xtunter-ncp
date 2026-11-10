@@ -89,6 +89,13 @@ def build_ep_execution_runtime(config: Any, ep_mesh: DeviceMesh | None) -> EPExe
             intra_layer_micro_batch=config.intra_layer_micro_batch,
             staging_reference=config.moonep_staging_reference,
             num_sms=config.moonep_num_sms,
+            tokens_per_rank=config.moonep_tokens_per_rank,
+            # The Ascend Buffer sizes its own home window from
+            # ``MOONEP_HOME_GENERATIONS``, so the XTuner-side layout has to use
+            # the same value or it would index a generation the heap never
+            # allocated. The env var wins for that reason; the config field is
+            # the fallback when it is unset.
+            home_generations=int(os.environ.get("MOONEP_HOME_GENERATIONS", config.moonep_home_generations)),
         )
     return NoEPExecutionRuntime()
 

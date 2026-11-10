@@ -25,9 +25,21 @@ class ExpertWeightLayout(NamedTuple):
     A dynamic-EP backend may hand ``MoEBlock`` a call-local weight alias whose
     dW still returns through autograd. Direct-output WGrad and external
     (two-segment) storage are not part of the first-version contract.
+
+    ``grad_weight_out`` (X8 path): when set, ``MoEBlock`` plumbs the pair of
+    heap gradient slot views into both ``GroupedLinear`` calls so
+    ``_GMMWithGradWeightOut`` writes dW directly into the heap (home ``add_`` +
+    dup ``copy_``), bypassing the autograd dW → bridge.backward chain. The
+    bridge still fires (via the re-enabled dx) to trigger
+    ``reduce_grad_bf16`` + FSDP ``.grad`` writeback.
     """
 
     trainable_weights: ProjectionPair | None = None
+    grad_weight_out: ProjectionPair | None = None
+    # True = first producer of this FSDP call (the home prefix has already
+    # been zeroed) -> the GEMM dw may write the whole heap block directly
+    # (semantics == add_/copy_), with zero dw materialization.
+    grad_weight_first: bool = False
 
 
 def _get_backward_pre_hook(backward_previous_event: torch.cuda.Event):

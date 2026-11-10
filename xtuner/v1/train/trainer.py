@@ -727,6 +727,53 @@ class Trainer:
                 assert_info += f", HF path load error Info: {error_info}"
             assert hf_interval is None and hf_max_keep is None and async_hf_export is False, assert_info
 
+        # MoonEP-Ascend sizes its symmetric heap from the per-rank token count,
+        # so knowing S up front lets the workspace install before the first
+        # forward instead of rebuilding it lazily. Two restrictions: only the
+        # Ascend backend needs it (the CUDA package leaves the value unset and
+        # sizes its own heap), and an explicit config value always wins.
+        if (
+            getattr(model_cfg, "dispatcher", None) == "moonep"
+            and model_cfg.moonep_tokens_per_rank is None
+            and DEVICE == "npu"
+        ):
+            s_total = None
+            # Peeking a streaming dataloader would consume and drop its first
+            # batch, so those fall back to the static estimate directly.
+            if isinstance(getattr(self._dataloader, "dataset", None), torch.utils.data.IterableDataset):
+                log_rank0.warning(
+                    "[MoonEP] S peek skipped for a streaming dataset; "
+                    "falling back to micro_batch_size * pack_max_length"
+                )
+            else:
+                try:
+                    peek_batch = next(iter(self._dataloader))
+                    sample = peek_batch[0] if isinstance(peek_batch, (list, tuple)) else peek_batch
+                    seq_ctx = sample.get("seq_ctx") if isinstance(sample, dict) else None
+                    cu_seq_lens = getattr(seq_ctx, "cu_seq_lens", None)
+                    if cu_seq_lens is not None:
+                        s_total = int(cu_seq_lens[-1].item())
+                except Exception as peek_err:
+                    log_rank0.warning(f"[MoonEP] S peek failed: {peek_err}")
+            if s_total is None:
+                # Soft pack makes the realized length differ from this upper
+                # bound (it packs whole samples, not to the brim), so the peek
+                # above is preferred whenever it works.
+                pack_max = getattr(dataloader_cfg, "pack_max_length", None)
+                if pack_max is None and dataloader_cfg.dataset_config_list:
+                    pack_max = getattr(dataloader_cfg.dataset_config_list[0], "pack_max_length", None)
+                s_total = self.micro_batch_size * int(pack_max) if pack_max else None
+            if s_total is not None and sp_size > 0:
+                # The peeked batch spans ``micro_batch_size`` micro-batches and
+                # every rank holds one SP shard of each, so divide by both.
+                s_per_rank = s_total // (self.micro_batch_size * sp_size)
+                if s_per_rank > 0:
+                    model_cfg.moonep_tokens_per_rank = s_per_rank
+                    log_rank0.info(
+                        f"[MoonEP] tokens_per_rank (S) = {s_per_rank} "
+                        f"(batch_total={s_total} / micro_batch={self.micro_batch_size} / SP={sp_size})"
+                    )
+
         self._engine = self.build_engine(
             model_path=load_from,
             model_config=model_cfg,

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import types
 from collections.abc import Sequence
-from typing import Any, cast
 
 import torch
 from torch import nn
@@ -17,8 +16,22 @@ from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedSt
 from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 from torch.distributed.tensor import DTensor
 
+from xtuner.v1.utils import get_device, log_rank0
+
 
 _TARGET_TORCH_VERSION = "2.12.1+cu132"
+
+
+def _npu_backend() -> bool:
+    """Whether the running torch build is torch_npu's.
+
+    Resolved at call time: ``torch.version.npu`` only exists once ``torch_npu``
+    has been imported, which can happen after this module is. On Ascend the
+    pinned version cannot match anyway (torch_npu ships its own torch build),
+    and ``_resolve_and_validate_targets`` still checks the structure field by
+    field, so the version is advisory there.
+    """
+    return get_device() == "npu"
 _BINDING_ATTR = "_xtuner_moonep_landing"
 _OWNER_ATTR = "_xtuner_moonep_fsdp_owner"
 _PROJECTION_ATTR = "_xtuner_moonep_projection"
@@ -62,9 +75,15 @@ def _resolve_and_validate_targets(
         state = _get_module_fsdp_state(fsdp_owner)
         if state is None:
             continue
-        # The 2.12 runtime has the plural list; its bundled type stub still
-        # exposes only the deprecated singular compatibility property.
-        for param_group in cast(Any, state)._fsdp_param_groups:
+        # 2.7/2.12 compatibility: torch 2.12 exposes the plural list
+        #   `_fsdp_param_groups`, torch 2.7.1 (torch_npu) the singular
+        #   `_fsdp_param_group` (a single FSDPParamGroup). Both provide
+        #   `group.fsdp_params`, so normalize to a list and iterate.
+        groups = getattr(state, "_fsdp_param_groups", None)
+        if groups is None:
+            pg = getattr(state, "_fsdp_param_group", None)
+            groups = [pg] if pg is not None else []
+        for param_group in groups:
             for fsdp_param in param_group.fsdp_params:
                 key = (id(fsdp_param._module_info.module), fsdp_param._module_info.param_name)
                 if key in by_identity:
@@ -94,9 +113,27 @@ def _resolve_and_validate_targets(
                 )
             if landing.numel() != unpadded_numel or landing.dtype is not expected_dtype:
                 raise RuntimeError(f"MoonEP VMM landing metadata mismatch for {layer_fqn}.{projection_name}")
-            if landing.device != fsdp_param.device or shard_world_size <= 1:
+            if landing.device != fsdp_param.device:
                 raise RuntimeError(
-                    f"MoonEP direct landing requires multi-rank CUDA FSDP for {layer_fqn}.{projection_name}"
+                    f"MoonEP VMM landing device {landing.device} != FSDP device "
+                    f"{fsdp_param.device} for {layer_fqn}.{projection_name}"
+                )
+            if shard_world_size <= 1:
+                if not _npu_backend():
+                    raise RuntimeError(
+                        f"MoonEP direct landing requires multi-rank CUDA FSDP for {layer_fqn}.{projection_name}"
+                    )
+                # Ascend single-shard: the expert weights are already complete
+                # locally (build_grouped_linear splits by EP), so the FSDP shard
+                # dimension is trivial. The DirectVMM hooks are unchanged —
+                # ``split_with_sizes_copy`` in foreach_all_gather_copy_out fills
+                # the home rows and a 1-rank subgroup degrades to a local copy;
+                # ``foreach_reduce`` is generic over ``ws == 1``. The only
+                # difference is no cross-shard averaging, which is correct
+                # because a home expert is computed by this rank alone.
+                log_rank0.info(
+                    f"MoonEP direct landing single-shard mode (shard_world_size=1): "
+                    f"{layer_fqn}.{projection_name}"
                 )
             if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
                 raise RuntimeError(f"MoonEP direct landing does not support post-AllGather extensions: {layer_fqn}")
@@ -126,9 +163,21 @@ def install_fsdp_vmm_landing(
     by FSDP, never an FQN guess.
     """
     if torch.__version__ != _TARGET_TORCH_VERSION:
-        raise RuntimeError(
-            f"MoonEP direct FSDP landing requires torch {_TARGET_TORCH_VERSION}, got {torch.__version__}"
-        )
+        if _npu_backend():
+            # torch_npu ships its own torch build, so the pinned version can
+            # never match. The FSDP internals were verified field by field
+            # (three hook signatures, the singular ``_fsdp_param_group``
+            # fallback below); ``_resolve_and_validate_targets`` still raises on
+            # any structural mismatch, so this is a warning.
+            log_rank0.warning(
+                f"MoonEP direct FSDP landing validated on torch {_TARGET_TORCH_VERSION}; "
+                f"running on torch {torch.__version__} with torch_npu "
+                f"{getattr(torch.version, 'npu', '<unknown>')} (structure checked at install time)"
+            )
+        else:
+            raise RuntimeError(
+                f"MoonEP direct FSDP landing requires torch {_TARGET_TORCH_VERSION}, got {torch.__version__}"
+            )
 
     selected = _resolve_and_validate_targets(fsdp_root, targets)
 
