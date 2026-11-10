@@ -6,7 +6,7 @@ from typing import Literal, Optional, Tuple
 import torch
 import torch.distributed as dist
 from cyclopts import Parameter
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from typing_extensions import Annotated
 
 from xtuner.v1.optim import ConceptMuon, LocalDTensorAdamW, Muon, SwapAdamW
@@ -141,6 +141,18 @@ class AdamWConfig(OptimConfig):
         )
 
 
+class ParamOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    algorithm: Annotated[
+        Literal["muon", "adamw"] | None,
+        Parameter(help="Optimizer algorithm. None uses the default parameter classification."),
+    ] = None
+    weight_decay: Annotated[
+        float | None,
+        Parameter(help="Weight decay override. None inherits the applicable default."),
+    ] = None
+
+
 class MuonConfig(OptimConfig):
     concept_muon: Annotated[
         bool,
@@ -173,29 +185,80 @@ class MuonConfig(OptimConfig):
     nesterov: Annotated[bool, Parameter(help="Use Nesterov momentum in Muon updates")] = True
     embedding_weight_decay: Annotated[
         float | None,
-        Parameter(help="Weight decay for embedding parameters. None uses weight_decay."),
+        Parameter(help="Default weight decay for embedding parameters; param_overrides takes precedence."),
     ] = None
-    weight_decay_overrides: Annotated[
-        dict[str, float],
-        Parameter(help="Ordered regex-to-weight-decay overrides for named parameters. First match wins."),
-    ] = {}
     one_d_weight_decay: Annotated[
         float | None,
-        Parameter(help="Weight decay for 1D / bias parameters in the AdamW group. None uses weight_decay."),
+        Parameter(help="Default weight decay for 1D / bias parameters; param_overrides takes precedence."),
     ] = None
+    param_overrides: Annotated[
+        dict[str, ParamOverride],
+        Parameter(help="Ordered regex-to-algorithm/weight-decay overrides. First match per name wins."),
+    ] = {}
 
     @model_validator(mode="before")
     @classmethod
-    def _concept_muon_defaults(cls, data):
-        # The split-projection layout expects Muon-group gradients to be clipped
-        # together with the AdamW groups; keep the historical default otherwise.
-        if isinstance(data, dict) and data.get("concept_muon") and "clip_grad_mode" not in data:
-            data = {**data, "clip_grad_mode": "all"}
+    def _normalize_config(cls, data):
+        if isinstance(data, dict):
+            legacy_overrides = data.get("weight_decay_overrides")
+            if legacy_overrides:
+                if data.get("param_overrides"):
+                    raise ValueError("weight_decay_overrides and param_overrides cannot be used together")
+                data = {
+                    **data,
+                    "param_overrides": {
+                        pattern: {"weight_decay": decay} for pattern, decay in legacy_overrides.items()
+                    },
+                }
+            if "weight_decay_overrides" in data:
+                data = {key: value for key, value in data.items() if key != "weight_decay_overrides"}
+            # The split-projection layout expects Muon-group gradients to be clipped
+            # together with the AdamW groups; keep the historical default otherwise.
+            if data.get("concept_muon") and "clip_grad_mode" not in data:
+                data = {**data, "clip_grad_mode": "all"}
         return data
+
+    @field_validator("param_overrides")
+    @classmethod
+    def _validate_param_override_patterns(cls, overrides):
+        for pattern in overrides:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"Invalid parameter override pattern {pattern!r}: {error}") from error
+        return overrides
+
+    def _resolve_param_overrides(self, model, trainable_params):
+        resolved = {}
+        for name, param in model.named_parameters(remove_duplicate=False):
+            if param not in trainable_params:
+                continue
+            for pattern, override in self.param_overrides.items():
+                if not re.search(pattern, name):
+                    continue
+                previous = resolved.get(param)
+                if previous is None:
+                    resolved[param] = override
+                    break
+                updates = {}
+                for field in ("algorithm", "weight_decay"):
+                    value = getattr(override, field)
+                    previous_value = getattr(previous, field)
+                    if value is not None and previous_value is not None and value != previous_value:
+                        raise ValueError(
+                            f"Conflicting parameter overrides for shared parameter at {name!r}: "
+                            f"{field}={previous_value!r} versus {value!r}"
+                        )
+                    if previous_value is None:
+                        updates[field] = value
+                resolved[param] = previous.model_copy(update=updates)
+                break
+        return resolved
 
     def build(self, model):
         trainable_parameters_names = model.trainable_parameters()
         trainable_names = {name for name, _ in trainable_parameters_names}
+        trainable_params = {param for _, param in trainable_parameters_names}
 
         muon_split_sizes = {}
         muon_qkv_split_shapes = {}
@@ -206,14 +269,7 @@ class MuonConfig(OptimConfig):
                 metadata = provider()
                 muon_split_sizes.update(metadata.get("split_sizes", {}))
         param_options = metadata.get("param_options", {})
-        weight_decay_overrides = {}
-        for name, p in model.named_parameters(remove_duplicate=False):
-            for pattern, decay in self.weight_decay_overrides.items():
-                if re.search(pattern, name):
-                    if p in weight_decay_overrides and weight_decay_overrides[p] != decay:
-                        raise ValueError(f"Conflicting weight decay overrides for shared parameter at {name!r}")
-                    weight_decay_overrides[p] = decay
-                    break
+        param_overrides = self._resolve_param_overrides(model, trainable_params)
 
         explicit_adamw_params = {}
         for module in model.modules():
@@ -254,58 +310,103 @@ class MuonConfig(OptimConfig):
         adamw_embed_params = []
         adamw_1d_params = []
 
+        weight_decays = {}
         for name, p in model.named_parameters():
             n = p.numel()
             num_total += n
-            if name in trainable_names:
-                num_total_requires_grad += n
-                if p in param_options:
-                    options = param_options[p]
-                    if options["algorithm"] != "adamw":
-                        raise ValueError("Explicit Muon fallback options must specify AdamW")
-                    explicit_adamw_params.setdefault(options["weight_decay"], []).append(p)
-                    num_adamw += n
-                    continue
-                # Muon only applies to 2D matrices; 3D tensors (e.g. GatedDeltaNet depthwise
-                # conv1d [C, 1, K]) and 1D tensors use AdamW, matching Megatron and Automodel.
-                # Flattening a degenerate 3D tensor explodes the spectral-norm lr ratio
-                # (observed x45 on Qwen3.5 conv1d, root cause of the step-10 grad_norm spike).
-                # effectively-1D tensors where one dimension accounts for all elements
-                # (e.g. shape [1, D]) should also be excluded, and hence the
-                # `p.numel() not in p.shape` condition.
+            if name not in trainable_names:
+                untrainable_names.append(name)
+                continue
+
+            num_total_requires_grad += n
+            options = param_options.get(p, {})
+            algorithm = options.get("algorithm")
+            if algorithm not in (None, "muon", "adamw"):
+                raise ValueError(f"Invalid optimizer algorithm {algorithm!r} for {name!r} in model metadata")
+            override = param_overrides.get(p)
+            if override is not None and override.algorithm is not None:
+                if algorithm is not None and override.algorithm != algorithm:
+                    raise ValueError(
+                        f"Conflicting optimizer algorithms for {name!r}: model metadata specifies "
+                        f"{algorithm!r}, parameter override specifies {override.algorithm!r}"
+                    )
+                algorithm = override.algorithm
+
+            decay = options.get("weight_decay")
+            if override is not None and override.weight_decay is not None:
+                decay = override.weight_decay
+            if decay is not None:
+                weight_decays[p] = decay
+
+            if algorithm == "muon":
+                if p.ndim < 2:
+                    raise ValueError(
+                        f"Cannot use Muon for {name!r} with shape {tuple(p.shape)}; "
+                        "Muon requires at least 2D parameters"
+                    )
+                is_muon_tensor = True
+            elif algorithm == "adamw":
+                is_muon_tensor = False
+            else:
+                # By default, Muon only applies to non-degenerate 2D matrices. Higher-rank
+                # tensors and effectively-1D tensors use AdamW unless explicitly overridden.
                 is_muon_tensor = (
                     p.ndim == 2 and "embed_tokens" not in name and "lm_head" not in name and p.numel() not in p.shape
                 )
-                if is_muon_tensor:
-                    if is_moe_model and any(pattern in name for pattern in fused_w1w3_patterns):
-                        muon_params_moe_fused_w1w3.append(p)
-                        num_muon_moe += n
-                        if dist.get_rank() == 0:
-                            logger.info(f"Muon moe param: [{name}]: shape = {p.shape}")
-                    elif is_moe_model and any(pattern in name for pattern in other_expert_patterns):
-                        muon_params_moe_other.append(p)
-                        num_muon_moe += n
-                        if dist.get_rank() == 0:
-                            logger.info(f"Muon moe param: [{name}]: shape = {p.shape}")
-                    else:
-                        muon_params_regular.append(p)
-                        num_muon_regular += n
-                        if dist.get_rank() == 0:
-                            logger.info(f"Muon regular param: [{name}]: shape = {p.shape}")
-                else:
-                    is_embed = "embed_tokens" in name or name.endswith("embeddings.weight")
-                    is_1d = p.ndim < 2 or p.numel() in p.shape
+
+            is_embed = "embed_tokens" in name or name.endswith("embeddings.weight")
+            is_1d = p.ndim < 2 or p.numel() in p.shape
+            if (
+                not is_muon_tensor
+                and is_embed
+                and is_1d
+                and self.embedding_weight_decay is not None
+                and self.one_d_weight_decay is not None
+                and self.embedding_weight_decay != self.one_d_weight_decay
+            ):
+                raise ValueError(
+                    f"Conflicting weight decay defaults for {name!r}: it matches both embedding "
+                    f"({self.embedding_weight_decay}) and 1D ({self.one_d_weight_decay}) defaults"
+                )
+
+            if p in param_options and algorithm == "adamw":
+                if decay is None:
                     if self.embedding_weight_decay is not None and is_embed:
-                        adamw_embed_params.append(p)
+                        decay = self.embedding_weight_decay
                     elif self.one_d_weight_decay is not None and is_1d:
-                        adamw_1d_params.append(p)
+                        decay = self.one_d_weight_decay
                     else:
-                        adamw_params.append(p)
-                    num_adamw += n
+                        decay = self.weight_decay
+                explicit_adamw_params.setdefault(decay, []).append(p)
+                num_adamw += n
+                continue
+
+            if is_muon_tensor:
+                if is_moe_model and any(pattern in name for pattern in fused_w1w3_patterns):
+                    muon_params_moe_fused_w1w3.append(p)
+                    num_muon_moe += n
                     if dist.get_rank() == 0:
-                        logger.info(f"AdamW param: [{name}]: shape = {p.shape}")
+                        logger.info(f"Muon moe param: [{name}]: shape = {p.shape}")
+                elif is_moe_model and any(pattern in name for pattern in other_expert_patterns):
+                    muon_params_moe_other.append(p)
+                    num_muon_moe += n
+                    if dist.get_rank() == 0:
+                        logger.info(f"Muon moe param: [{name}]: shape = {p.shape}")
+                else:
+                    muon_params_regular.append(p)
+                    num_muon_regular += n
+                    if dist.get_rank() == 0:
+                        logger.info(f"Muon regular param: [{name}]: shape = {p.shape}")
             else:
-                untrainable_names.append(name)
+                if self.embedding_weight_decay is not None and is_embed:
+                    adamw_embed_params.append(p)
+                elif self.one_d_weight_decay is not None and is_1d:
+                    adamw_1d_params.append(p)
+                else:
+                    adamw_params.append(p)
+                num_adamw += n
+                if dist.get_rank() == 0:
+                    logger.info(f"AdamW param: [{name}]: shape = {p.shape}")
 
         # Build parameter groups
         clip_muon_grad = self.clip_grad_mode == "all"
@@ -361,16 +462,16 @@ class MuonConfig(OptimConfig):
                 )
             )
 
-        if weight_decay_overrides:
-            overridden_param_groups = []
+        if weight_decays:
+            resolved_param_groups = []
             for group in param_groups:
                 params_by_decay = {}
                 for p in group["params"]:
-                    decay = weight_decay_overrides.get(p, group.get("weight_decay", self.weight_decay))
+                    decay = weight_decays.get(p, group.get("weight_decay", self.weight_decay))
                     params_by_decay.setdefault(decay, []).append(p)
                 for decay, parameters in params_by_decay.items():
-                    overridden_param_groups.append({**group, "params": parameters, "weight_decay": decay})
-            param_groups = overridden_param_groups
+                    resolved_param_groups.append({**group, "params": parameters, "weight_decay": decay})
+            param_groups = resolved_param_groups
 
         total_assigned = sum(len(group["params"]) for group in param_groups)
         total_trainable = len(trainable_names)
