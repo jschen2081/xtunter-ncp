@@ -685,10 +685,11 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         engine_ref = _build_engine(ep_size=1, expert_tp_size=expert_tp_size)
         engine_ref.init_model_weights()
 
+        micro_batch_size = 2
         engine_domino = _build_engine(
             ep_size=1,
             expert_tp_size=expert_tp_size,
-            intra_layer_micro_batch=2,
+            intra_layer_micro_batch=micro_batch_size,
         )
         engine_domino.init_model_weights()
         _copy_matching_engine_weights(engine_ref, engine_domino)
@@ -697,8 +698,8 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
 
         device_obj = torch.device(device, dist.get_rank() % torch.cuda.device_count())
         batches = [
-            _make_engine_input(device_obj, seed_offset=dist.get_rank() * 2),
-            _make_engine_input(device_obj, seed_offset=dist.get_rank() * 2 + 1),
+            _make_engine_input(device_obj, seed_offset=dist.get_rank() * micro_batch_size + micro_batch_idx)
+            for micro_batch_idx in range(micro_batch_size)
         ]
         _assert_rank_inputs_are_distinct(batches)
         loss_cfg = CELossConfig()
@@ -722,7 +723,10 @@ class TestMoETrainEngineExpertTPOnly(DeterministicDDPTestCase):
         loss_ref, calls_ref = run_with_expert_call_count(engine_ref)
         norm_ref = engine_ref.clip_grad_norm(do_clip=False).detach().float().cpu()
         assert calls_ref > 0
-        assert calls_domino * (2 if expert_tp_size == 1 else 1) == calls_ref, (calls_domino, calls_ref)
+        if expert_tp_size == 1:
+            assert calls_domino * micro_batch_size == calls_ref, (calls_domino, calls_ref)
+        else:
+            assert calls_domino == calls_ref, (calls_domino, calls_ref)
 
         if collective_stages is not None:
             _assert_domino_expert_tp_collective_stages(collective_stages)
