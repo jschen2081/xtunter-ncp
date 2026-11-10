@@ -142,7 +142,7 @@ class AdamWConfig(OptimConfig):
 
 
 class ParamOverride(BaseModel):
-    """Algorithm and weight-decay settings for one regex-selected parameter set.
+    """Configure optimizer and decay for regex-selected parameters.
 
     ``MuonConfig.param_overrides`` maps ordered regex patterns to these settings. It only affects trainable parameters
     handled by ``MuonConfig``; it does not apply to ``AdamWConfig``. A pattern that matches no trainable parameter is
