@@ -757,6 +757,15 @@ class MoEDecoderLayer(nn.Module):
             pre_combined=pre_combined,
             combined=combined,
         )
+        # One cross-rank barrier per layer, same contract as the micro-batch path:
+        # with MOONEP_COMBINE_OVERLAP=1 the buffer skips its own per-combine barrier,
+        # so without this the slot reset of this layer's combine races the next
+        # layer's dispatch MAGIC write across ranks. A host-side wait on the local
+        # combine is not enough: it says nothing about the other ranks' resets.
+        layer_barrier = getattr(self.dispatcher, "layer_barrier", None)
+        if layer_barrier is not None:
+            layer_barrier()
+
         combined_hidden_states = post_combined["hidden_states"].view(origin_b, origin_s, -1)
         return self._project_from_experts(combined_hidden_states)
 
