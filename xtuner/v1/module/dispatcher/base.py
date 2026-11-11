@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import (
     Generic,
     Literal,
+    NamedTuple,
     TypeAlias,
     TypeVar,
 )
@@ -15,6 +16,18 @@ from .expert_tp import ExpertTP
 
 
 HiddenStates: TypeAlias = torch.Tensor
+ProjectionPair: TypeAlias = tuple[torch.Tensor, torch.Tensor]
+
+
+class ExpertWeightLayout(NamedTuple):
+    """Call-local expert weight ownership at the dispatcher/MLP seam.
+
+    A dynamic-EP backend may hand ``MoEBlock`` a call-local weight alias whose
+    dW still returns through autograd. Direct-output WGrad and external
+    (two-segment) storage are not part of the first-version contract.
+    """
+
+    trainable_weights: ProjectionPair | None = None
 
 
 def _get_backward_pre_hook(backward_previous_event: torch.cuda.Event):
@@ -59,6 +72,7 @@ class PostDispatchResult(TypedDict):
     # TODO:
     hidden_states: torch.Tensor
     tokens_per_expert: torch.Tensor
+    expert_weight_layout: ExpertWeightLayout
 
 
 class PreCombineResult(TypedDict):
@@ -110,6 +124,18 @@ class GenericDispatcher(
         self._training_dtype = training_dtype
         self._generate_dtype = generate_dtype
 
+    def prepare_layer_inputs(
+        self,
+        layer_inputs: list[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], list[object | None]]:
+        """Prepare all inputs of one FSDP layer call before branching.
+
+        Most dispatchers have no work to schedule before attention, so they
+        keep the identity behavior.  A backend that needs an autograd ordering
+        seam may return an opaque token for ``dispatch_preprocess``.
+        """
+        return layer_inputs, [None] * len(layer_inputs)
+
     @property
     def supports_micro_batch_pack(self) -> bool:
         return False
@@ -140,6 +166,10 @@ class GenericDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        # Source-logical counts are owned by Router. Post-dispatch counts have
+        # a different meaning: local physical groups consumed by expert GMM.
+        tokens_per_expert: torch.Tensor,
+        layer_state: object | None = None,
         async_op: bool = False,
     ) -> PreDispatch: ...
 
@@ -268,8 +298,11 @@ class NaiveDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        layer_state: object | None = None,
         async_op: bool = False,
     ) -> NaivePreDispatchResult:
+        del tokens_per_expert, layer_state
         # With no ExpertTP there is no communication to overlap. The micro-batch
         # layer still requests async dispatch, so use the ordinary local path.
         async_op = async_op and self._expert_tp is not None
@@ -416,6 +449,7 @@ class NaiveDispatcher(
                 hidden_states=hidden_states,
                 row_ids_map=row_id_maps,
                 tokens_per_expert=tokens_per_expert,
+                expert_weight_layout=ExpertWeightLayout(),
             )
 
     @override

@@ -20,6 +20,7 @@ from . import XTUNER_DISPATCHER_DEBUG
 from .base import (
     CombineResult,
     DispatchResult,
+    ExpertWeightLayout,
     GenericDispatcher,
     PostCombineResult,
     PostDispatchResult,
@@ -329,8 +330,11 @@ class DeepEPDispatcher(
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        layer_state: object | None = None,
         async_op: bool = False,
     ) -> DeepEPPreDispatchResult:
+        del tokens_per_expert, layer_state
         if async_op:
             backward_previous_event = EventOverlap(None)
             if hidden_states.grad_fn is not None:
@@ -503,6 +507,7 @@ class DeepEPDispatcher(
                 hidden_states=permuted_hidden_states,
                 row_ids_map=row_ids_map,
                 tokens_per_expert=tokens_per_expert,
+                expert_weight_layout=ExpertWeightLayout(),
             )
 
     @override

@@ -50,6 +50,7 @@ class FakeEngine:
         self.grad_norm_calls = 0
         self.optimizer_step_calls = 0
         self.optimizer_device_calls = []
+        self.close_calls = 0
 
         self.model = model = nn.Linear(10, 10)
         self.optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -108,6 +109,9 @@ class FakeEngine:
 
     def destroy_async_checkpoint_pg(self) -> None:
         pass
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def prepare(fn):
@@ -197,6 +201,7 @@ class TestTrainerSaveHF(DistributedTestBase):
         expected_dirs = {"hf-9", "hf-10", "hf-latest"}
         actual_dirs = {d.name for d in hf_dirs}
         self.assertEqual(actual_dirs, expected_dirs)
+        self.assertEqual(trainer._engine.close_calls, 1)
 
         # Verify the files were actually created and contain expected content
         for hf_dir in hf_dirs:
