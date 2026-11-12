@@ -4,15 +4,22 @@
 output rounds once to bf16, matching the fp32 reference decomposition.
 XTUNER_NPU_FUSED_ZC_NORM=1 (default) selects it on NPU; a one-shot
 ``npu_rms_norm`` self-test falls back to the native torch expression.
-"""
 
-import os
+The self-test runs on the first forward, never at import time: touching the
+device during module import initialises it before HCCL binds it per rank,
+which leaves ranks with different VMM free-VA layouts.
+"""
 
 import torch
 
 
 def npu_zero_centered_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
     import torch_npu  # type: ignore[import-untyped]
+
+    if not rmsnorm_fused_ok():
+        from . import native_zero_centered_rms_norm
+
+        return native_zero_centered_rms_norm(x, weight, epsilon)
 
     # (1 + w) folds into the fp32 gamma of the fused RMSNorm op; the output
     # rounds once to bf16, matching the fp32 reference decomposition.
@@ -23,7 +30,7 @@ def _rmsnorm_selftest() -> bool:
     import torch_npu  # type: ignore[import-untyped]
 
     try:
-        dev = f"npu:{os.environ.get('LOCAL_RANK', '0')}"
+        dev = f"npu:{torch.npu.current_device()}"
         x = torch.randn(64, 128, device=dev).to(torch.bfloat16).requires_grad_()
         w = torch.ones(128, device=dev, dtype=torch.float32).requires_grad_()
         y = torch_npu.npu_rms_norm(x, w + 1.0, 1e-6)[0]

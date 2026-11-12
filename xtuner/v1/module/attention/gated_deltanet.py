@@ -58,13 +58,13 @@ if get_device() == "npu":
         from ...ops.gated_deltanet.rms_norm_gated_npu import (
             RMSNormGated as _NpuRMSNormGated,
         )
-        from ...ops.gated_deltanet.rms_norm_gated_npu import (
-            gated_fused_ok,
-        )
 
         FusedRMSNormGated = _NpuRMSNormGated  # type: ignore[misc,assignment]
         has_fused_rms_norm_gated = True
-        gated_fused_ok()
+        # The npu_rms_norm self-test runs on the first forward (RMSNormGated
+        # calls gated_fused_ok itself), not here: allocating on the device
+        # during import initialises it before HCCL binds it per rank, which
+        # leaves ranks with different VMM free-VA layouts.
     except Exception as _npu_gated_norm_exc:  # pragma: no cover
         print(
             f"[rms_norm_gated] npu fused gated norm unavailable ({_npu_gated_norm_exc!r}); fla fallback",

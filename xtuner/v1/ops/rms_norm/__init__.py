@@ -81,12 +81,14 @@ def get_zero_centered_rms_norm_fn() -> RMSNormProtocol:
         # Fused zero-centered RMSNorm on NPU (npu_rms_norm with (1 + w) folded
         # into the fp32 gamma), gated by XTUNER_NPU_FUSED_ZC_NORM (default on);
         # the knob off or a failed npu_rms_norm self-test keeps the native
-        # torch expression.
+        # torch expression. The self-test runs on the first call, not here:
+        # allocating on the device at import time initialises it before HCCL
+        # binds it per rank, which shifts each rank's VMM free-VA layout and
+        # breaks the MoonEP symmetric-heap grid.
         if os.getenv("XTUNER_NPU_FUSED_ZC_NORM", "1") == "1":
-            from .npu_zero_centered import npu_zero_centered_rms_norm, rmsnorm_fused_ok
+            from .npu_zero_centered import npu_zero_centered_rms_norm
 
-            if rmsnorm_fused_ok():
-                return npu_zero_centered_rms_norm
+            return npu_zero_centered_rms_norm
         return native_zero_centered_rms_norm
     else:
         raise NotImplementedError(f"RMSNorm is not implemented on {device}")

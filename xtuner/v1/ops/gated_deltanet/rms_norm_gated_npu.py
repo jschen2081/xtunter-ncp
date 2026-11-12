@@ -23,7 +23,7 @@ _FUSED_GATED_NORM = bool(int(os.environ.get("XTUNER_NPU_FUSED_GATED_NORM", "1"))
 def _npu_rms_norm_selftest() -> bool:
     """Probe the ``npu_rms_norm`` op the fused branch rests on."""
     try:
-        dev = f"npu:{os.environ.get('LOCAL_RANK', '0')}"
+        dev = f"npu:{torch.npu.current_device()}"
         x = torch.randn(64, 128, device=dev).to(torch.bfloat16).requires_grad_()
         w = torch.ones(128, device=dev, dtype=torch.float32).requires_grad_()
         y = torch_npu.npu_rms_norm(x, w, 1e-6)[0]
