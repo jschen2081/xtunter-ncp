@@ -741,6 +741,7 @@ class MoEDecoderLayer(nn.Module):
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
             post_dispatched=post_dispatched,
+            async_op=self._async_combine,
             decoding=False,
         )
         combined = self.dispatcher.combine(
@@ -748,6 +749,7 @@ class MoEDecoderLayer(nn.Module):
             dispatched=dispatched,
             post_dispatched=post_dispatched,
             pre_combined=pre_combined,
+            async_op=self._async_combine,
             decoding=False,
         )
         post_combined = self.dispatcher.combine_postprocess(
@@ -756,6 +758,7 @@ class MoEDecoderLayer(nn.Module):
             post_dispatched=post_dispatched,
             pre_combined=pre_combined,
             combined=combined,
+            async_op=self._async_combine,
         )
         # One cross-rank barrier per layer, same contract as the micro-batch path:
         # with MOONEP_COMBINE_OVERLAP=1 the buffer skips its own per-combine barrier,
