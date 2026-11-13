@@ -153,20 +153,9 @@ class _MoonEPResources:
         if not self._buffer_box:
             assert _moonep_backend is not None
             if self.is_ascend:
-                # Each EP group gets its own SHMEM bootstrap port. The group ID is
-                # the global rank of this group's root (dist.get_global_rank(ep_group, 0))
-                # — every rank in the group computes the same value, and different
-                # groups get different values. Do not use dist.get_rank(ep_group)
-                # (that is the in-group rank 0..R-1, so ranks in the same group
-                # would compute different ports and clients would connect to the
-                # wrong server).
-                # The DeviceMesh EP dimension interleaves across nodes, so several
-                # group roots share the master and the ports must be offset.
-                group_root_global_rank = dist.get_global_rank(self.ep_group, 0)
-                base_port = int(self.ip_port.rsplit(":", 1)[-1])
-                host = self.ip_port.rsplit(":", 1)[0]
-                shmem_port = base_port + group_root_global_rank
-                shmem_ip_port = f"{host}:{shmem_port}"
+                # SHMEM 走 UNIQUEID bootstrap (aclshmemx_get_uniqueid +
+                # all_gather_object), 不再需要 ip_port 地址, 因此也不需要按
+                # EP group 错开端口。
                 buffer = _moonep_backend.BufferXtuner(
                     S=tokens_per_rank,
                     H=self.hidden_size,
@@ -176,7 +165,6 @@ class _MoonEPResources:
                     group=self.ep_group,
                     explicitly_destroy=True,
                     num_sms=self.num_sms,
-                    ip_port=shmem_ip_port,
                     ffn_hidden_size=self.intermediate_size,
                     gradient_slots=self.gradient_slots,
                 )
