@@ -27,8 +27,18 @@ def sp_split(
 def sp_gather(tensor, sp_mesh: DeviceMesh, dim: int):
     if sp_mesh.size() == 1:
         return tensor
-    tensor_list = dist.all_gather(tensor, group=sp_mesh.get_group())
-    return torch.cat(tensor_list, dim=dim)
+    # NOTE: ``mmengine.dist.all_gather`` first casts to the "communication device" it
+    # infers from the group backend. Under a device-specific backend map such as
+    # ``npu:hccl`` (no CPU backend registered) that inference can land on CPU and then
+    # blow up inside c10d with "No backend type associated with device type cpu".
+    # Run the collective on ``DEVICE`` explicitly and restore the input device, so
+    # CPU-resident tensors (e.g. shifted_labels) can still be gathered.
+    group = sp_mesh.get_group()
+    src_device = tensor.device
+    on_device = tensor.to(DEVICE)
+    tensor_list = [torch.empty_like(on_device) for _ in range(sp_mesh.size())]
+    torch.distributed.all_gather(tensor_list, on_device, group=group)
+    return torch.cat(tensor_list, dim=dim).to(src_device)
 
 
 def len2weight(x, loss_reduction):
