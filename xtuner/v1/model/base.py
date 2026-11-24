@@ -696,6 +696,7 @@ class BaseModel(nn.Module):
         reshard_after_forward: bool,
         offload_policy: CPUOffloadPolicy | None,
         module: nn.Module | None = None,
+        extra_ignored_params: set[nn.Parameter] | None = None,
     ) -> None:
         def traverse(module):
             for name, param in module.named_parameters(recurse=False):
@@ -771,6 +772,11 @@ class BaseModel(nn.Module):
         target = module or self
         if patterns:
             traverse(target)
+
+        if extra_ignored_params:
+            # Params that already carry their own placement (e.g. vocab-parallel
+            # lm_head sharded on the EP dim) are managed outside FSDP entirely.
+            ignored_params |= set(extra_ignored_params)
 
         fully_shard(
             target,

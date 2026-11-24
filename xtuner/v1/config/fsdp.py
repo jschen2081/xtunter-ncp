@@ -42,6 +42,15 @@ class FSDPConfig(BaseModel):
     param_dtype: Annotated[torch.dtype, Parameter(help="Data type for model parameters")] = torch.bfloat16
     reduce_dtype: Annotated[torch.dtype, Parameter(help="Data type for reduction operations")] = torch.bfloat16
     fp32_lm_head: Annotated[bool, Parameter(help="Use float32 for language model head")] = False
+    vocab_parallel_size: Annotated[
+        int,
+        Parameter(
+            help=(
+                "Split the vocabulary dimension of lm_head across the expert-parallel group. "
+                "1 disables vocab parallelism; otherwise it must equal ep_size and divide vocab_size."
+            )
+        ),
+    ] = 1
     # TODO: deprecate `torch_compile` in favor of `compile_cfg` in XTunerBaseModelConfig
     torch_compile: Annotated[bool, Parameter(help="Enable model compilation for faster inference")] = True
     mesh_prefix: Annotated[str, Parameter(help="Prefix for device mesh configuration in distributed training")] = (

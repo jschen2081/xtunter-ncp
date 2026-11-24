@@ -1,6 +1,7 @@
 from typing import Any, TypeAlias
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
@@ -34,6 +35,34 @@ class LMHead(nn.Linear):
         if not 0 < logical_out_features <= out_features:
             raise ValueError("logical_out_features must be positive and no larger than out_features")
         self.logical_out_features = logical_out_features
+        self.vocab_parallel_size = 1
+        self.vocab_start_index = 0
+        self.vocab_end_index = out_features
+        self.vocab_group: dist.ProcessGroup | None = None
+
+    def set_vocab_parallel(
+        self,
+        size: int,
+        start_index: int,
+        end_index: int,
+        group: dist.ProcessGroup,
+    ) -> None:
+        """Record the vocabulary slice this rank owns.
+
+        Args:
+            size (int): Number of vocabulary shards.
+            start_index (int): First global vocabulary id owned by this rank.
+            end_index (int): One past the last global vocabulary id owned by this rank.
+            group (torch.distributed.ProcessGroup): Group whose ranks partition the vocabulary.
+        """
+        if size <= 1:
+            raise ValueError("vocab parallel size must be greater than 1")
+        if not 0 <= start_index < end_index <= self.out_features:
+            raise ValueError("invalid vocabulary slice")
+        self.vocab_parallel_size = size
+        self.vocab_start_index = start_index
+        self.vocab_end_index = end_index
+        self.vocab_group = group
 
     @overload  # type: ignore[override]
     def forward(
@@ -60,9 +89,22 @@ class LMHead(nn.Linear):
             w = self.weight
             b = self.bias
         if loss_ctx is None:
+            if self.vocab_parallel_size > 1:
+                raise NotImplementedError("A vocab-parallel lm_head cannot return full logits")
             logits = F.linear(hidden_states, w, b)
             logits = logits[..., : self.logical_out_features]
             return None, (logits.float(), {})
+        if self.vocab_parallel_size > 1:
+            if type(loss_ctx) is not LMHeadLossContext:
+                raise NotImplementedError("A vocab-parallel lm_head supports only the plain CE loss context")
+            return loss_ctx.forward(
+                hidden_states,
+                w,
+                b,
+                vocab_start_index=self.vocab_start_index,
+                vocab_end_index=self.vocab_end_index,
+                vocab_group=self.vocab_group,
+            )
         elif self.logical_out_features < self.out_features:
             if loss_ctx.__class__ is not LMHeadLossContext:
                 raise NotImplementedError("Padded LM heads currently support only the plain CE loss context")

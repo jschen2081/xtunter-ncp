@@ -1425,6 +1425,10 @@ class MoE(BaseModel):
             # 需要显式放到 Replicate DTensor 上，后续梯度才会跨 expert TP 平均。
             self._replicate_other_params(self)
 
+        # Must run after `_replicate_other_params` (which leaves lm_head as an
+        # EP-replicated DTensor) and before the FSDP units are built.
+        self._apply_vocab_parallel_lm_head()
+
         # Although rotary_emb was already constructed in __init__, it was built on the meta device.
         # Here we need to rebuild it on the actual device to calculate coefficients like inv_freq.
         # xTODO: remove this because init with actual device already, Check it
@@ -1482,13 +1486,19 @@ class MoE(BaseModel):
             module=self.norm,
         )
 
-        self._fully_shard(
-            mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=lm_head_mp_policy,
-            reshard_after_forward=False,
-            offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
-            module=self.lm_head,
-        )
+        if self.fsdp_config.vocab_parallel_size > 1:
+            # The head owns its own placement (Replicate on FSDP, Shard(0) on EP)
+            # and is deliberately left outside FSDP; see `_apply_vocab_parallel_lm_head`.
+            lm_head_ignored_params = {p for _, p in self.lm_head.named_parameters(recurse=False)}
+        else:
+            lm_head_ignored_params = None
+            self._fully_shard(
+                mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+                mp_policy=lm_head_mp_policy,
+                reshard_after_forward=False,
+                offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                module=self.lm_head,
+            )
 
         # Shard MTP block if it exists
         if self.mtp_block is not None:
@@ -1525,6 +1535,7 @@ class MoE(BaseModel):
             mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            extra_ignored_params=lm_head_ignored_params,
         )
         self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
 
@@ -1799,6 +1810,61 @@ class MoE(BaseModel):
                 traverse(child)
 
         traverse(model)
+
+    def _apply_vocab_parallel_lm_head(self) -> None:
+        """Shard ``lm_head`` along the vocabulary dimension on the EP group.
+
+        Every rank keeps ``vocab_size / P`` rows of the head while the FSDP
+        dimension holds replicas of the same rows. Keeping the head outside FSDP
+        avoids the all-gather of the full weight on every forward; the partial
+        token gradients across FSDP replicas are averaged later by
+        ``scale_and_reduce_grad``, which already handles tensors that carry both
+        a ``Replicate`` and a ``Shard`` placement.
+        """
+        size = self.fsdp_config.vocab_parallel_size
+        if size == 1:
+            return
+        if self.config.expert_tp_size > 1:
+            raise NotImplementedError("vocab_parallel_size does not support expert TP yet")
+        if self.fsdp_config.hsdp_sharding_size is not None:
+            raise NotImplementedError("vocab_parallel_size does not support HSDP yet")
+        if self.mtp_block is not None:
+            raise NotImplementedError("vocab_parallel_size does not support MTP heads yet")
+
+        ep_mesh = self.ep_mesh
+        world_mesh = self._world_mesh
+        assert ep_mesh is not None and world_mesh is not None
+        if size != ep_mesh.size():
+            raise ValueError(
+                f"vocab_parallel_size ({size}) must equal ep_size ({ep_mesh.size()}) when enabled"
+            )
+        vocab_size = self.config.vocab_size
+        if vocab_size % size != 0:
+            raise ValueError(f"vocab_size ({vocab_size}) must be divisible by vocab_parallel_size ({size})")
+        if self.lm_head.logical_out_features != self.lm_head.out_features:
+            raise NotImplementedError("vocab_parallel_size does not support a padded lm_head")
+
+        ep_dim_name = f"{self.config.mesh_prefix}.ep"
+        mesh_dim_names = world_mesh.mesh_dim_names
+        assert mesh_dim_names is not None
+        placements = [Shard(0) if name == ep_dim_name else Replicate() for name in mesh_dim_names]
+
+        for name, param in list(self.lm_head.named_parameters(recurse=False)):
+            local_param = param.to_local().detach() if isinstance(param, DTensor) else param.detach()
+            dist_param = nn.Parameter(
+                distribute_tensor(local_param, world_mesh, placements),
+                requires_grad=param.requires_grad,
+            )
+            self.lm_head.register_parameter(name, dist_param)
+
+        ep_rank = dist.get_rank(ep_mesh.get_group())
+        rows_per_rank = vocab_size // size
+        self.lm_head.set_vocab_parallel(
+            size=size,
+            start_index=ep_rank * rows_per_rank,
+            end_index=(ep_rank + 1) * rows_per_rank,
+            group=ep_mesh.get_group(),
+        )
 
     @staticmethod
     def patched_emb_forward(self, input):
