@@ -47,15 +47,28 @@ def _all_gather_flat(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Te
     return torch.cat(gathered, dim=0)
 
 
-class _VocabParallelLinear(torch.autograd.Function):
-    """Linear over the vocabulary slice of this rank, applied to every rank's tokens.
+class _VocabParallelCE(torch.autograd.Function):
+    """Cross entropy over this rank's vocabulary slice, fused with its linear.
 
-    Each rank gathers the whole group's hidden states and projects them with its
-    own ``[V / P, H]`` slice, so the language-model loss sees every token on every
-    rank while the head weight is never materialised in full. The input gradient
-    is the group-wide sum of the per-slice partial products; the weight gradient
-    covers every token already and is divided by the group size to match the
-    data-parallel mean the rest of the model uses.
+    Each rank gathers the band's hidden states and projects them with its own
+    ``[V / P, H]`` slice, so every rank scores every token while the head weight
+    is never materialised in full. The input gradient is the group-wide sum of
+    the per-slice partial products; the weight gradient covers every token
+    already and is divided by the group size to match the data-parallel mean the
+    rest of the model uses.
+
+    The whole forward runs under ``no_grad`` and the only full-size tensor kept
+    for the backward is the unnormalised softmax, which ``backward`` rewrites in
+    place into the logit gradient. Leaving this to autograd costs an extra
+    ``[tokens, V / P]`` fp32 buffer: ``torch.gather`` holds its input for the
+    target-logit backward, and ``exp`` holds its output. At 32768 x 18992 that
+    is 2374 MiB per copy.
+
+    Hand-writing the backward also means the group reduction that autograd used
+    to perform (``torch.distributed.nn.functional.all_reduce`` on the log-sum-exp
+    partial sums) has to be folded in here: dividing the loss by ``P`` and then
+    reducing once gives the logits gradient of the *summed* loss, which is what
+    the outer world all-reduce expects.
     """
 
     @staticmethod
@@ -63,30 +76,98 @@ class _VocabParallelLinear(torch.autograd.Function):
         ctx: Any,
         hidden_states: torch.Tensor,
         weight: torch.Tensor,
+        shifted_labels: torch.Tensor,
+        loss_weight: torch.Tensor,
         vocab_group: dist.ProcessGroup,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        ignore_idx: int,
     ) -> torch.Tensor:
-        local_tokens = hidden_states.numel() // hidden_states.size(-1)
-        flat_hidden = hidden_states.reshape(local_tokens, hidden_states.size(-1))
-        flat_hidden = _all_gather_flat(flat_hidden, vocab_group)
-        # The head lives outside FSDP, so nothing casts the fp32 master to the
-        # activation dtype for us; mirror what FSDP's mixed precision would do.
-        compute_weight = weight.to(flat_hidden.dtype)
-        ctx.save_for_backward(flat_hidden, compute_weight)
+        num_features = hidden_states.size(-1)
+        local_tokens = hidden_states.numel() // num_features
+        world = dist.get_world_size(vocab_group)
+        with torch.no_grad():
+            flat_hidden = _all_gather_flat(hidden_states.reshape(local_tokens, num_features), vocab_group)
+            # The head lives outside FSDP, so nothing casts the fp32 master to the
+            # activation dtype for us; mirror what FSDP's mixed precision would do.
+            compute_weight = weight.to(flat_hidden.dtype)
+            local_vocab_size = compute_weight.size(0)
+            logits = F.linear(flat_hidden, compute_weight).float()
+            logits = logits.reshape(-1, local_vocab_size)
+
+            # Every rank projected the whole band's tokens, so the labels and
+            # their weights must be gathered in the same rank order as the
+            # hidden states.
+            labels = _all_gather_flat(shifted_labels.flatten(), vocab_group)
+            weights = _all_gather_flat(loss_weight.flatten(), vocab_group)
+
+            ignore_mask = labels == ignore_idx
+            in_local = (labels >= vocab_start_index) & (labels < vocab_end_index) & ~ignore_mask
+            target_index = torch.where(in_local, labels - vocab_start_index, torch.zeros_like(labels))
+            # Only the rank owning the label contributes; the rest add zero.
+            target_logit = torch.where(
+                in_local,
+                logits.gather(-1, target_index[:, None]).squeeze(-1),
+                torch.zeros((), dtype=logits.dtype, device=logits.device),
+            )
+            dist.all_reduce(target_logit, op=dist.ReduceOp.SUM, group=vocab_group)
+
+            # From here the buffer is rewritten in place all the way to the
+            # normalised softmax, so no second full-size copy is ever live.
+            logits.masked_fill_(ignore_mask[:, None], float("-inf"))
+            local_max = logits.max(dim=-1).values
+            dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=vocab_group)
+            global_max = torch.where(torch.isneginf(local_max), torch.zeros_like(local_max), local_max)
+            logits.sub_(global_max[:, None]).exp_()
+
+            global_sum = logits.sum(dim=-1)
+            dist.all_reduce(global_sum, op=dist.ReduceOp.SUM, group=vocab_group)
+            lse = global_max + global_sum.log()
+
+            token_loss = lse - target_logit
+            # Masked tokens produce -inf above; zero them before they meet a
+            # zero weight.
+            token_loss = torch.where(ignore_mask, torch.zeros_like(token_loss), token_loss)
+            # Every rank of the group computed the same full-token loss, so the
+            # outer world-sum reduce would multiply it by P. Divide here.
+            loss = (token_loss * weights).sum() / world
+
+        ctx.softmax = logits
+        ctx.global_sum = global_sum
+        ctx.ignore_mask = ignore_mask
+        ctx.flat_hidden = flat_hidden
+        ctx.compute_weight = compute_weight
+        ctx.weights = weights
+        ctx.target_index = target_index
+        ctx.in_local = in_local
         ctx.weight_dtype = weight.dtype
         ctx.vocab_group = vocab_group
         ctx.local_tokens = local_tokens
         ctx.input_shape = hidden_states.shape
         ctx.rank = dist.get_rank(vocab_group)
-        return F.linear(flat_hidden, compute_weight)
+        ctx.world = world
+        return loss
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
-        flat_hidden, compute_weight = ctx.saved_tensors
+    def backward(ctx: Any, grad_loss: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        # d loss / d z = w * (global softmax - onehot). The ``P`` that the
+        # autograd-aware all-reduce used to contribute is applied here directly,
+        # because the forward folded the group sum into a plain in-place reduce.
+        softmax = ctx.softmax
+        # A fully masked row has an all -inf logit row, so its softmax is 0 and
+        # the group sum is 0; it is excluded by `in_local` and its loss weight is
+        # 0, so dividing by 1 there just keeps the arithmetic finite.
+        denom = torch.where(ctx.ignore_mask, torch.ones_like(ctx.global_sum), ctx.global_sum)
+        softmax.div_(denom[:, None])
+        rows = ctx.in_local.nonzero().squeeze(1)
+        if rows.numel() > 0:
+            softmax[rows, ctx.target_index[rows]] -= 1.0
+        softmax.mul_((ctx.weights * grad_loss)[:, None])
+
         grad_input = None
         grad_weight = None
-        flat_grad_output = grad_output.reshape(-1, grad_output.size(-1))
         if ctx.needs_input_grad[0]:
-            grad_full = flat_grad_output.matmul(compute_weight)
+            grad_full = softmax.matmul(ctx.compute_weight)
             # Every rank projected the same tokens, so each token's gradient is
             # only a partial sum over the vocabulary slices.
             dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.vocab_group)
@@ -96,9 +177,17 @@ class _VocabParallelLinear(torch.autograd.Function):
             # The gather covers every rank's tokens, so this row slice already
             # holds the group-wide sum. Convert it to the data-parallel mean the
             # rest of the model uses.
-            grad_weight = flat_grad_output.t().matmul(flat_hidden)
-            grad_weight = (grad_weight / dist.get_world_size(ctx.vocab_group)).to(ctx.weight_dtype)
-        return grad_input, grad_weight, None
+            grad_weight = softmax.t().matmul(ctx.flat_hidden) / ctx.world
+            grad_weight = grad_weight.to(ctx.weight_dtype)
+
+        # Drop the full-size references here rather than waiting for the
+        # autograd graph (and its cycle-collecting GC pass) to go away: the
+        # chunk loop runs the next chunk's forward immediately, and holding this
+        # buffer alive across it doubles the CE peak.
+        ctx.softmax = None
+        ctx.flat_hidden = None
+        ctx.compute_weight = None
+        return grad_input, grad_weight, None, None, None, None, None, None
 
 
 class CELossConfig(BaseLossConfig):
@@ -340,59 +429,18 @@ class LMHeadLossContext(BaseLossContext):
         """
         if head_bias is not None:
             raise NotImplementedError("Vocab-parallel CE does not support a head bias")
-
-        logits = _VocabParallelLinear.apply(hidden_states, head_weight, vocab_group)
-        local_vocab_size = logits.size(-1)
-        logits = logits.float().reshape(-1, local_vocab_size)
-
-        # Every rank projected the whole group's tokens, so the labels and their
-        # weights must be gathered in the same rank order as the hidden states.
         assert loss_kwargs.loss_weight is not None, "loss_weight can not be None"
-        shifted_labels = _all_gather_flat(loss_kwargs.shifted_labels.flatten(), vocab_group)
-        loss_weight = _all_gather_flat(loss_kwargs.loss_weight.flatten(), vocab_group)
 
-        ignore_idx = self.loss_cfg.ignore_idx
-        ignore_mask = shifted_labels == ignore_idx
-        in_local = (shifted_labels >= vocab_start_index) & (shifted_labels < vocab_end_index) & ~ignore_mask
-        target_index = torch.where(in_local, shifted_labels - vocab_start_index, torch.zeros_like(shifted_labels))
-        # `gather` records `logits` for its backward, so the buffer must stay
-        # untouched; the masked copy below becomes the single work buffer.
-        local_target = torch.where(
-            in_local,
-            logits.gather(-1, target_index[:, None]).squeeze(-1),
-            torch.zeros((), dtype=logits.dtype, device=logits.device),
+        loss = _VocabParallelCE.apply(
+            hidden_states,
+            head_weight,
+            loss_kwargs.shifted_labels,
+            loss_kwargs.loss_weight,
+            vocab_group,
+            vocab_start_index,
+            vocab_end_index,
+            self.loss_cfg.ignore_idx,
         )
-
-        # One full-size temporary from here on: at 32768 tokens x 18992 columns
-        # in fp32, every extra copy of this shape costs 2374 MiB.
-        masked_logits = logits.masked_fill(ignore_mask[:, None], float("-inf"))
-
-        # The shift is detached: log-sum-exp is invariant to it, and `-inf`
-        # rows mean every rank agrees the token is masked. Detaching also keeps
-        # `masked_logits` out of any autograd node that would object to the
-        # in-place shift below.
-        local_max = masked_logits.detach().max(dim=-1).values.clone()
-        dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=vocab_group)
-        global_max = torch.where(torch.isneginf(local_max), torch.zeros_like(local_max), local_max)
-
-        masked_logits.sub_(global_max[:, None])
-        masked_logits.exp_()
-        local_sum = masked_logits.sum(dim=-1)
-        # Autograd-aware SUM: every rank sees the global log-sum-exp and the
-        # backward distributes the shared gradient back to each local partial sum.
-        global_sum = all_reduce(local_sum, op=dist.ReduceOp.SUM, group=vocab_group)
-        lse = global_max + global_sum.log()
-
-        global_target = all_reduce(local_target, op=dist.ReduceOp.SUM, group=vocab_group)
-
-        token_loss = lse - global_target
-        # Masked tokens produce -inf above; zero them before they meet a zero weight.
-        token_loss = torch.where(ignore_mask, torch.zeros_like(token_loss), token_loss)
-        # Every rank of the group computed the same full-token loss, so the
-        # outer world-sum reduce would multiply it by P. Divide here: the value
-        # lands on the true loss and the gradient is compensated by the same
-        # factor when autograd walks back through the world reduce.
-        loss = (token_loss * loss_weight).sum() / dist.get_world_size(vocab_group)
         return loss, (None, {})
 
     def eager_mode(
